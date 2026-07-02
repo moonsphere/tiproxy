@@ -5,15 +5,22 @@ package server
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 	"github.com/pingcap/tiproxy/lib/util/logger"
+	"github.com/pingcap/tiproxy/pkg/discovery/pb"
 	"github.com/pingcap/tiproxy/pkg/sctx"
 	"github.com/pingcap/tiproxy/pkg/util/etcd"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 func TestServer(t *testing.T) {
@@ -64,4 +71,53 @@ func resetPromRegistry() func() {
 		prometheus.DefaultRegisterer = oldRegisterer
 		prometheus.DefaultGatherer = oldGatherer
 	}
+}
+
+func TestDiscoveryServer(t *testing.T) {
+	restore := resetPromRegistry()
+	defer restore()
+
+	dir := t.TempDir()
+	lg, _ := logger.CreateLoggerForTest(t)
+	etcdServer, err := etcd.CreateEtcdServer("0.0.0.0:0", dir, lg)
+	require.NoError(t, err)
+	t.Cleanup(etcdServer.Close)
+	endpoint := etcdServer.Clients[0].Addr().String()
+
+	// Pick a free port for the API server.
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	apiAddr := lis.Addr().String()
+	require.NoError(t, lis.Close())
+
+	configFile := dir + "/config.toml"
+	configData := fmt.Sprintf("[proxy]\npd-addrs = %q\n[api]\naddr = %q\n", endpoint, apiAddr)
+	require.NoError(t, os.WriteFile(configFile, []byte(configData), 0o644))
+
+	server, err := NewDiscoveryServer(context.Background(), &sctx.Context{
+		ConfigFile: configFile,
+	})
+	require.NoError(t, err)
+
+	// The server turns ready after the first topology bootstrap.
+	conn, err := grpc.NewClient(apiAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+	healthCli := healthpb.NewHealthClient(conn)
+	require.Eventually(t, func() bool {
+		resp, err := healthCli.Check(context.Background(), &healthpb.HealthCheckRequest{})
+		return err == nil && resp.Status == healthpb.HealthCheckResponse_SERVING
+	}, 10*time.Second, 100*time.Millisecond)
+
+	// Subscribing returns a full (empty) topology snapshot.
+	stream, err := pb.NewTiDBDiscoveryClient(conn).Subscribe(context.Background(), &pb.SubscribeRequest{ClientId: "test"})
+	require.NoError(t, err)
+	resp, err := stream.Recv()
+	require.NoError(t, err)
+	require.True(t, resp.Full)
+	require.Empty(t, resp.Upserted)
+
+	require.NoError(t, server.Close())
 }

@@ -26,13 +26,14 @@ const (
 
 // metrics labels.
 const (
-	LabelServer  = "server"
-	LabelBalance = "balance"
-	LabelSession = "session"
-	LabelMonitor = "monitor"
-	LabelBackend = "backend"
-	LabelTraffic = "traffic"
-	LabelReplay  = "replay"
+	LabelServer    = "server"
+	LabelBalance   = "balance"
+	LabelSession   = "session"
+	LabelMonitor   = "monitor"
+	LabelBackend   = "backend"
+	LabelTraffic   = "traffic"
+	LabelDiscovery = "discovery"
+	LabelReplay    = "replay"
 )
 
 // MetricsManager manages metrics.
@@ -130,6 +131,12 @@ func init() {
 		CrossLocationBytesCounter,
 		ReplayPendingCmdsGauge,
 		ReplayWaitTime,
+		DiscoverySubscribersGauge,
+		DiscoverySubDroppedCounter,
+		DiscoveryRevisionGauge,
+		DiscoveryBackendsGauge,
+		DiscoveryRebootstrapCounter,
+		DiscoveryBroadcastCounter,
 	}
 }
 

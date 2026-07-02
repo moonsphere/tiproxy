@@ -60,5 +60,24 @@ func main() {
 		return err
 	}
 
+	discoveryCmd := &cobra.Command{
+		Use:   "discovery",
+		Short: "run as a TiDB topology discovery hub for sidecar TiProxy instances",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			srv, err := server.NewDiscoveryServer(cmd.Context(), sctx)
+			if err != nil {
+				return errors.Wrapf(err, "fail to create discovery server")
+			}
+
+			<-cmd.Context().Done()
+			if e := srv.Close(); e != nil {
+				err = errors.Wrapf(err, "shutdown with errors")
+			}
+
+			return err
+		},
+	}
+	rootCmd.AddCommand(discoveryCmd)
+
 	cmd.RunRootCommand(rootCmd)
 }
