@@ -34,6 +34,18 @@ addr = "0.0.0.0:3080"
 tiproxy discovery --config hub.toml
 ```
 
+Docker 镜像内置模板 `/etc/proxy/hub.toml`（源码 `conf/hub.toml`），k8s 里同一镜像
+换 args 即可：
+
+```yaml
+# hub Deployment（与 sidecar 同一镜像）
+command: ["/bin/tiproxy", "discovery", "--config", "/etc/proxy/hub.toml"]
+# 用 ConfigMap 挂载覆盖 /etc/proxy/hub.toml，至少要设 pd-addrs
+```
+
+构建镜像：`make docker DOCKERPREFIX=<repo>/ IMAGE_TAG=<tag>`（多平台发布用
+`make docker-release`）。
+
 - K≥2 副本挂在一个 k8s Service（如 `tidb-discovery.<ns>.svc:3080`）后面。
 - readiness 探针：gRPC health（首次拓扑 bootstrap 成功后才 SERVING），或 HTTP
   `GET /debug/health`。PD 不可达时 hub 永不 ready，k8s 自动把 sidecar 挡在空 hub
@@ -132,8 +144,8 @@ Sidecar 侧无新指标；hub 断连体现在日志
 1. hub 是否 ready：`grpc_health_v1` SERVING / `tiproxy_discovery_backends` 正常。
    hub 连不上 PD 时永不 ready，所有订阅被 readiness 拒绝。
 2. 网络可达：sidecar 能否连通 `hub-addrs`。
-3. **TLS 配置是否对称**：hub 侧 api TLS 用 `security.server-http-tls`，sidecar 侧
-   HubClient 用 `security.cluster-ssl`（与集群内组件互访 api 的既有配对一致）。
+3. **TLS 配置是否对称**：hub 侧 api TLS 用 `[security.server-http-tls]`，sidecar
+   侧 HubClient 用 `[security.cluster-tls]`（与集群内组件互访 api 的既有配对一致）。
    任一侧单边开 TLS，连接会被立刻重置（cmux 不匹配明文 h2c / TLS 握手打进明文
    端口），表现就是这个快速重连循环 —— 这是有意的 fail-fast，不要通过在 TLS 端
    点上放行明文 gRPC 来"修复"。
