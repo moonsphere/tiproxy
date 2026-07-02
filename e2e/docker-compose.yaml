@@ -1,0 +1,108 @@
+version: "3.8"
+
+# E2E topology for the discovery hub. See docs/design/discovery-hub-e2e.md.
+#
+#   pd + tikv + tidb-0/1 (+ tidb-2 on the "scale" profile)
+#   hub-0/hub-1: tiproxy in discovery mode, watching pd
+#   sidecar:     tiproxy with a hub-sourced cluster, no PD access at all
+
+services:
+  pd:
+    image: ${TIDB_CLUSTER_IMAGE_PREFIX:-pingcap/}pd:${TIDB_CLUSTER_VERSION:-v8.5.1}
+    command:
+      - --name=pd
+      - --client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://pd:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-peer-urls=http://pd:2380
+
+  tikv:
+    image: ${TIDB_CLUSTER_IMAGE_PREFIX:-pingcap/}tikv:${TIDB_CLUSTER_VERSION:-v8.5.1}
+    command:
+      - --pd=pd:2379
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv:20160
+      - --status-addr=0.0.0.0:20180
+    depends_on:
+      - pd
+
+  tidb-0:
+    image: ${TIDB_CLUSTER_IMAGE_PREFIX:-pingcap/}tidb:${TIDB_CLUSTER_VERSION:-v8.5.1}
+    # @@hostname is the assertion fingerprint, so pin it to the service name.
+    hostname: tidb-0
+    command:
+      - --store=tikv
+      - --path=pd:2379
+      - --advertise-address=tidb-0
+    depends_on:
+      - tikv
+
+  tidb-1:
+    image: ${TIDB_CLUSTER_IMAGE_PREFIX:-pingcap/}tidb:${TIDB_CLUSTER_VERSION:-v8.5.1}
+    # @@hostname is the assertion fingerprint, so pin it to the service name.
+    hostname: tidb-1
+    command:
+      - --store=tikv
+      - --path=pd:2379
+      - --advertise-address=tidb-1
+    depends_on:
+      - tikv
+
+  # Started and stopped by the scale-out/in scenarios.
+  tidb-2:
+    image: ${TIDB_CLUSTER_IMAGE_PREFIX:-pingcap/}tidb:${TIDB_CLUSTER_VERSION:-v8.5.1}
+    # @@hostname is the assertion fingerprint, so pin it to the service name.
+    hostname: tidb-2
+    profiles: ["scale"]
+    command:
+      - --store=tikv
+      - --path=pd:2379
+      - --advertise-address=tidb-2
+    depends_on:
+      - tikv
+
+  # Never started before the total-hub-outage scenario: the sidecar must have
+  # never seen it, to prove a genuinely new backend stays invisible without hubs.
+  tidb-3:
+    image: ${TIDB_CLUSTER_IMAGE_PREFIX:-pingcap/}tidb:${TIDB_CLUSTER_VERSION:-v8.5.1}
+    # @@hostname is the assertion fingerprint, so pin it to the service name.
+    hostname: tidb-3
+    profiles: ["scale"]
+    command:
+      - --store=tikv
+      - --path=pd:2379
+      - --advertise-address=tidb-3
+    depends_on:
+      - tikv
+
+  hub-0:
+    image: ${TIPROXY_IMAGE:-moonsphere/tiproxy:discovery-hub}
+    entrypoint: ["/bin/tiproxy", "discovery", "--config", "/etc/proxy-e2e/hub.toml"]
+    volumes:
+      - ./conf:/etc/proxy-e2e:ro
+    ports:
+      - "43081:3080"
+    depends_on:
+      - pd
+
+  hub-1:
+    image: ${TIPROXY_IMAGE:-moonsphere/tiproxy:discovery-hub}
+    entrypoint: ["/bin/tiproxy", "discovery", "--config", "/etc/proxy-e2e/hub.toml"]
+    volumes:
+      - ./conf:/etc/proxy-e2e:ro
+    ports:
+      - "43082:3080"
+    depends_on:
+      - pd
+
+  sidecar:
+    image: ${TIPROXY_IMAGE:-moonsphere/tiproxy:discovery-hub}
+    entrypoint: ["/bin/tiproxy", "--config", "/etc/proxy-e2e/sidecar.toml"]
+    volumes:
+      - ./conf:/etc/proxy-e2e:ro
+    ports:
+      - "46000:6000"
+      - "43080:3080"
+    depends_on:
+      - hub-0
+      - hub-1
