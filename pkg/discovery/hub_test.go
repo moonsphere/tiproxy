@@ -18,6 +18,7 @@ import (
 	"github.com/pingcap/tiproxy/pkg/manager/infosync"
 	"github.com/pingcap/tiproxy/pkg/metrics"
 	"github.com/pingcap/tiproxy/pkg/util/etcd"
+	"github.com/pingcap/tiproxy/pkg/util/waitgroup"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -427,4 +428,61 @@ func TestHubNotBootstrapped(t *testing.T) {
 	require.Error(t, err)
 	_, ok := status.FromError(err)
 	require.True(t, ok)
+}
+
+// TestHubManySubscribers is a small-scale load test: many concurrent
+// subscribers all receive the full snapshot and subsequent deltas.
+func TestHubManySubscribers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skip the load test in short mode")
+	}
+	ts := newHubTestSuite(t)
+	t.Cleanup(ts.close)
+	ts.putTiDB("1.1.1.1:4000", "", "1.1.1.1", 10080)
+	require.Eventually(t, func() bool {
+		ts.hub.mu.RLock()
+		defer ts.hub.mu.RUnlock()
+		return len(ts.hub.mu.snap) == 1
+	}, testRecvTimeout, 10*time.Millisecond)
+
+	const subscribers = 200
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	conn, err := grpc.NewClient(ts.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+	cli := pb.NewTiDBDiscoveryClient(conn)
+
+	type subState struct {
+		stream pb.TiDBDiscovery_SubscribeClient
+	}
+	subs := make([]subState, subscribers)
+	for i := range subs {
+		stream, err := cli.Subscribe(ctx, &pb.SubscribeRequest{ClientId: fmt.Sprintf("load-%d", i)})
+		require.NoError(t, err)
+		subs[i].stream = stream
+		resp := recvWithTimeout(t, stream)
+		require.True(t, resp.Full)
+		require.Len(t, resp.Upserted, 1)
+	}
+	ts.hub.mu.RLock()
+	require.Len(t, ts.hub.mu.subs, subscribers)
+	ts.hub.mu.RUnlock()
+
+	// One topology change fans out to every subscriber.
+	ts.putTiDB("2.2.2.2:4000", "", "2.2.2.2", 10080)
+	var wg waitgroup.WaitGroup
+	for i := range subs {
+		stream := subs[i].stream
+		wg.Run(func() {
+			resp := recvWithTimeout(t, stream)
+			require.False(t, resp.Full)
+			require.Len(t, resp.Upserted, 1)
+			require.Equal(t, "2.2.2.2:4000", resp.Upserted[0].Addr)
+		}, ts.lg)
+	}
+	wg.Wait()
 }

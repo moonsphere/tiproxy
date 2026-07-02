@@ -538,32 +538,31 @@ hub-addrs = "tidb-discovery-c1.svc:3080"
 - **可观测性**：hub 需暴露 subscriber 数、watch lag、当前 rev 的 metrics，否则
   hub 落后 PD 时无感。
 
-## 11. ⚠️ 已知限制：hub 模式下 metrics-based 负载均衡是关的
+## 11. hub 模式下的 metrics 均衡（实现后修订：比原判轻）
 
-不是 followup —— 是要提前接受的性质。
+> **PR4 实证修订**：原设计判定"hub 模式 metrics 均衡失效"。实现时发现上游
+> #1176 已加"Prometheus 查不到时直接从 backend 读 metrics"的 missing-metrics
+> 路径，结论变轻，如下。
 
-**先掂量分量：metrics 均衡是默认行为，不是可选高级功能** ——
-`balance.policy` 默认 `"resource"`（`lib/config/balance.go:96`），resource 策略靠
-CPU/内存等 metrics 因子选后端。所以 hub 模式的这个降级动的是**默认路径**。
+背景分量：`balance.policy` 默认 `"resource"`（`lib/config/balance.go:96`），
+resource 策略靠 CPU/内存等 metrics 因子选后端 —— hub 模式动的是**默认路径**。
 
-每个 `Cluster` 私有一个 `ClusterReader`（`cluster.go:117`,
-`metricsreader.NewClusterReader`），其内部仍通过 **etcd** 选举 owner
-（`backend_reader.go` `elect.NewElection`）采集 per-backend 负载。hub 集群
-**没有 etcd 客户端**，所以：
+每个 `Cluster` 私有一个 `ClusterReader`（`cluster.go:117`），原本通过 **etcd**
+选举 owner 去采集 per-backend 负载并在成员间去重分发。hub 集群**没有 etcd 客户
+端**，实际行为（PR4 实现）：
 
-- `election.Start` 在 nil etcd 时立即返回（`election.go:95`）—— **不崩**，但全
-  fleet 永远选不出 owner → **没人读 backend metrics** → 负载因子失效。router 回退
-  到非 metrics 因子（健康、连接数、label/zone）。
-- 这**恰好是今天 static / no-PD 的行为**，是已知可用的下限 —— 但对 mesh 丢掉了
-  CPU/负载感知的 TiDB 选择，是真实降级。
+- `election.Start` 对 nil etcd 立即返回（有 nil-guard），永远选不出 owner；
+  `queryAllOwners` 对 nil etcd 返回空（PR4 加的守卫，原本会 panic）。
+- 无 owner + 无 owner 可转发 → 每个成员都命中 **missing-metrics 路径**
+  （`backend_reader.go` "read directly from backends"）→ **每个 sidecar 自己直接
+  从全部 backend 的 status port 读 metrics**。
+- 结果：**resource 均衡策略在 hub 模式仍然工作**。丢掉的只是选举带来的读取去重
+  —— 代价从"1 个 owner 读 T 个 backend"变成"N 个 sidecar 各读 T 个 backend"，
+  TiDB status port 承受 N 份采集负载。
 
-**干净的修法是让 hub 也带 metrics。** 扩展 `DiscoveryResponse`（已捎了
-`PrometheusInfo`）加上 per-backend 负载样本：hub 采集一次 Prometheus / TiDB status
-port，把负载连拓扑一起推。sidecar 从流里给 backend 排序 —— 无 per-sidecar 选举、无
-per-sidecar 采集。范围更大，作紧接着的 follow-up。
-
-过渡选项：(a) 接受降级；或 (b) 保留**少量**带 `pd-addrs` 的非 sidecar TiProxy 继续
-跑选举 + 采集 —— 但这引回 etcd 消费者，更建议先 (a) 再把 metrics 折进 hub。
+**后续优化（可选，不再紧迫）**：让 hub 顺带采集并把 per-backend 负载塞进
+`DiscoveryResponse`（已捎 `PrometheusInfo`），sidecar 从流里拿负载 —— 把 N×T 的
+直接采集收敛回 K×T。当 N×T 的 status port 采集量成为实际问题时再做。
 
 ## 12. Rollout
 

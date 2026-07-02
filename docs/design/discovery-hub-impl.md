@@ -436,14 +436,19 @@ tidb，~lease TTL 后 sidecar 后端列表收敛。
 
 ---
 
-## PR5 —— 收尾：文档 + 集成验证
+## PR5 —— 收尾：文档 + 集成验证（落地版）
 
-1. `README`/部署文档：`discovery` 子命令、新配置项、K 副本部署拓扑、
-   Service DNS 约定。
-2. Grafana：discovery 指标面板（subscribers、revision 落后、drop）。
-3. 压测脚本（可选，`scripts/`）：模拟 N 个 HubClient 订阅单 hub，观察
-   broadcast/drop —— 验证 1000 订阅者容量。
-4. Canary 手册：`discovery-source` 逐台切换步骤、回滚步骤（切回 `pd` 滚动重启）。
+1. ✅ `README`：Service Discovery 小节加 hub 简介 + 文档链接。
+2. ✅ 部署/运维/Canary/监控：合并成一份
+   [discovery-hub-ops.md](discovery-hub-ops.md)（部署拓扑、配置样例、行为差异
+   表、灰度与回滚步骤、指标 + PromQL、容量参考）。
+3. ⚠️ Grafana 面板：`tiproxy_summary.json` 由 grafonnet 生成，仓库无 jsonnet 工
+   具链，手改会导致 json/jsonnet 分叉 —— 面板 PromQL 先落在 ops 文档 §6,
+   工具链就绪后再补 Discovery row。
+4. ✅ 压测：落成常驻单测 `TestHubManySubscribers`（200 订阅者全量+增量 fan-out
+   <1s，`-short` 跳过），比一次性脚本可维护。
+5. ✅ 设计文档 §11 按 PR4 实证修订：hub 模式 metrics 均衡经 missing-metrics
+   直接读取路径仍然工作,限制降级为"无选举去重"。
 
 ---
 

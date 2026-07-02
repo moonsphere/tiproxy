@@ -24,6 +24,8 @@ When a new TiDB instance starts, the TiProxy detects the new TiDB instance and m
 
 The TiProxy also checks health on TiDB instances to ensure they are alive, and migrates the backend connections to other TiDB instances if any instance is down.
 
+For large sidecar-style deployments where hundreds of TiProxy instances would otherwise poll PD directly, TiProxy can also run as a topology hub (`tiproxy discovery`) that watches PD once and pushes the TiDB topology to the other instances, keeping the load on PD constant. See the [design doc](docs/design/discovery-hub.md) and the [operations guide](docs/design/discovery-hub-ops.md).
+
 ## Architecture
 
 For more details, see [Design Doc](https://github.com/pingcap/tidb/blob/master/docs/design/2022-07-20-session-manager.md).
