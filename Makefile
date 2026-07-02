@@ -34,7 +34,7 @@ endif
 IMAGE_TAG ?= latest
 EXECUTABLE_TARGETS := $(patsubst cmd/%,cmd_%,$(wildcard cmd/*))
 
-.PHONY: cmd_% test lint docker docker-release golangci-lint gocovmerge clean
+.PHONY: cmd_% test lint docker docker-release golangci-lint gocovmerge clean e2e
 
 default: cmd
 
@@ -102,6 +102,12 @@ clean:
 
 docker:
 	docker build -t "$(DOCKERPREFIX)tiproxy:$(IMAGE_TAG)" --build-arg "GOPROXY=$(shell $(GO) env GOPROXY)" --build-arg "VERSION=$(VERSION)" --build-arg "COMMIT=$(COMMIT)" --build-arg "BRANCH=$(BRANCH)" -f docker/Dockerfile .
+
+# End-to-end tests for the discovery hub (docs/design/discovery-hub-e2e.md).
+# Requires docker with the compose plugin. Set E2E_KEEP_CLUSTER=1 to keep the
+# compose cluster running after a failure for debugging.
+e2e: docker
+	cd e2e && TIPROXY_IMAGE="$(DOCKERPREFIX)tiproxy:$(IMAGE_TAG)" $(GO) test -tags e2e -v -timeout 30m .
 
 docker-release:
 	docker buildx build --platform linux/amd64,linux/arm64 --push -t "$(DOCKERPREFIX)tiproxy:$(IMAGE_TAG)" --build-arg "GOPROXY=$(shell $(GO) env GOPROXY)" --build-arg "VERSION=$(VERSION)" --build-arg "COMMIT=$(COMMIT)" --build-arg "BRANCH=$(BRANCH)" -f docker/Dockerfile .

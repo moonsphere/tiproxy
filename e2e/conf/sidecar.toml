@@ -1,0 +1,15 @@
+# E2E: the sidecar subscribes to the hubs and never touches PD.
+[proxy]
+addr = "0.0.0.0:6000"
+pd-addrs = ""
+
+[[proxy.backend-clusters]]
+name = "default"
+discovery-source = "hub"
+hub-addrs = "hub-0:3080,hub-1:3080"
+
+[api]
+addr = "0.0.0.0:3080"
+
+[log]
+level = "info"
