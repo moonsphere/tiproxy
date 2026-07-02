@@ -7,9 +7,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -264,12 +266,26 @@ func (is *InfoSyncer) GetTiDBTopology(ctx context.Context) (map[string]*TiDBTopo
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	kvs := append(resNoKeyspace.Kvs, resWithKeyspace.Kvs...)
+	kvs := make(map[string][]byte, len(resNoKeyspace.Kvs)+len(resWithKeyspace.Kvs))
+	for _, kv := range resNoKeyspace.Kvs {
+		kvs[hack.String(kv.Key)] = kv.Value
+	}
+	for _, kv := range resWithKeyspace.Kvs {
+		kvs[hack.String(kv.Key)] = kv.Value
+	}
+	return ParseTiDBTopology(is.lg, kvs), nil
+}
 
+// ParseTiDBTopology derives the live TiDB topology from raw topology KVs.
+// The map keys are full etcd keys prefixed with tidbTopologyInformationPath or
+// tidbKeyspaceTopologyInformationPath and the map values are the raw etcd values.
+// A backend is kept only when both its info and ttl keys exist, otherwise it may be down.
+// It iterates the KVs in the sorted order of keys so that the result is deterministic.
+func ParseTiDBTopology(lg *zap.Logger, kvs map[string][]byte) map[string]*TiDBTopologyInfo {
 	infos := make(map[string]*TiDBTopologyInfo, len(kvs)/2)
 	ttls := make(map[string]struct{}, len(kvs)/2)
-	for _, kv := range kvs {
-		key := hack.String(kv.Key)
+	for _, fullKey := range slices.Sorted(maps.Keys(kvs)) {
+		key := fullKey
 		var keyspace string
 		if strings.HasPrefix(key, tidbKeyspaceTopologyInformationPath) {
 			key = key[len(tidbKeyspaceTopologyInformationPath):]
@@ -292,9 +308,9 @@ func (is *InfoSyncer) GetTiDBTopology(ctx context.Context) (map[string]*TiDBTopo
 		case strings.HasSuffix(key, infoSuffix):
 			var topology *TiDBTopologyInfo
 			addr := key[:len(key)-len(infoSuffix)-1]
-			if err = json.Unmarshal(kv.Value, &topology); err != nil {
-				is.lg.Error("unmarshal topology info failed", zap.String("key", key),
-					zap.String("value", hack.String(kv.Value)), zap.Error(err))
+			if err := json.Unmarshal(kvs[fullKey], &topology); err != nil {
+				lg.Error("unmarshal topology info failed", zap.String("key", key),
+					zap.String("value", hack.String(kvs[fullKey])), zap.Error(err))
 			} else {
 				infos[addr] = topology
 				topology.Addr = addr
@@ -309,7 +325,7 @@ func (is *InfoSyncer) GetTiDBTopology(ctx context.Context) (map[string]*TiDBTopo
 			delete(infos, addr)
 		}
 	}
-	return infos, nil
+	return infos
 }
 
 func (is *InfoSyncer) GetPromInfo(ctx context.Context) (*PrometheusInfo, error) {
