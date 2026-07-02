@@ -428,3 +428,134 @@ func (ts *etcdTestSuite) createEtcdServer(addr string) {
 	require.NoError(ts.t, err)
 	ts.server = etcd
 }
+
+func TestParseTiDBTopology(t *testing.T) {
+	lg, _ := logger.CreateLoggerForTest(t)
+	infoJSON := func(ip string, port uint) string {
+		data, err := json.Marshal(&TiDBTopologyInfo{
+			IP:         ip,
+			StatusPort: port,
+			Labels:     map[string]string{"zone": "z1"},
+		})
+		require.NoError(t, err)
+		return string(data)
+	}
+	infoKey := func(keyspace, addr string) string {
+		p := path.Join(tidbTopologyInformationPath, addr, infoSuffix)
+		if keyspace != "" {
+			p = path.Join(tidbKeyspaceTopologyInformationPath, keyspace, p)
+		}
+		return p
+	}
+	ttlKey := func(keyspace, addr string) string {
+		p := path.Join(tidbTopologyInformationPath, addr, ttlSuffix)
+		if keyspace != "" {
+			p = path.Join(tidbKeyspaceTopologyInformationPath, keyspace, p)
+		}
+		return p
+	}
+
+	tests := []struct {
+		name  string
+		kvs   map[string][]byte
+		check func(t *testing.T, infos map[string]*TiDBTopologyInfo)
+	}{
+		{
+			name: "info and ttl both exist",
+			kvs: map[string][]byte{
+				infoKey("", "1.1.1.1:4000"): []byte(infoJSON("1.1.1.1", 10080)),
+				ttlKey("", "1.1.1.1:4000"):  []byte("123456789"),
+			},
+			check: func(t *testing.T, infos map[string]*TiDBTopologyInfo) {
+				require.Len(t, infos, 1)
+				info := infos["1.1.1.1:4000"]
+				require.NotNil(t, info)
+				require.Equal(t, "1.1.1.1:4000", info.Addr)
+				require.Equal(t, "1.1.1.1", info.IP)
+				require.Equal(t, uint(10080), info.StatusPort)
+				require.Equal(t, map[string]string{"zone": "z1"}, info.Labels)
+				require.Empty(t, info.Keyspace)
+			},
+		},
+		{
+			name: "info without ttl is dropped",
+			kvs: map[string][]byte{
+				infoKey("", "1.1.1.1:4000"): []byte(infoJSON("1.1.1.1", 10080)),
+			},
+			check: func(t *testing.T, infos map[string]*TiDBTopologyInfo) {
+				require.Empty(t, infos)
+			},
+		},
+		{
+			name: "ttl without info is absent",
+			kvs: map[string][]byte{
+				ttlKey("", "1.1.1.1:4000"): []byte("123456789"),
+			},
+			check: func(t *testing.T, infos map[string]*TiDBTopologyInfo) {
+				require.Empty(t, infos)
+			},
+		},
+		{
+			name: "keyspace topology",
+			kvs: map[string][]byte{
+				infoKey("ks1", "2.2.2.2:4000"): []byte(infoJSON("2.2.2.2", 10080)),
+				ttlKey("ks1", "2.2.2.2:4000"):  []byte("123456789"),
+			},
+			check: func(t *testing.T, infos map[string]*TiDBTopologyInfo) {
+				require.Len(t, infos, 1)
+				info := infos["2.2.2.2:4000"]
+				require.NotNil(t, info)
+				require.Equal(t, "ks1", info.Keyspace)
+				require.Equal(t, "2.2.2.2:4000", info.Addr)
+			},
+		},
+		{
+			name: "bad json is skipped and others are kept",
+			kvs: map[string][]byte{
+				infoKey("", "1.1.1.1:4000"): []byte("{invalid json"),
+				ttlKey("", "1.1.1.1:4000"):  []byte("123456789"),
+				infoKey("", "3.3.3.3:4000"): []byte(infoJSON("3.3.3.3", 10080)),
+				ttlKey("", "3.3.3.3:4000"):  []byte("123456789"),
+			},
+			check: func(t *testing.T, infos map[string]*TiDBTopologyInfo) {
+				require.Len(t, infos, 1)
+				require.NotNil(t, infos["3.3.3.3:4000"])
+			},
+		},
+		{
+			name: "malformed keyspace keys are skipped",
+			kvs: map[string][]byte{
+				tidbKeyspaceTopologyInformationPath + "noslash":                       []byte("x"),
+				tidbKeyspaceTopologyInformationPath + "/topology/tidb/a:4000/info":    []byte("x"),
+				tidbKeyspaceTopologyInformationPath + "ks1/other/tidb/b:4000/info":    []byte("x"),
+				tidbKeyspaceTopologyInformationPath + "ks1/topology/tidb/c:4000/misc": []byte("x"),
+			},
+			check: func(t *testing.T, infos map[string]*TiDBTopologyInfo) {
+				require.Empty(t, infos)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.check(t, ParseTiDBTopology(lg, tt.kvs))
+		})
+	}
+}
+
+func TestParseTiDBTopologyDeterministic(t *testing.T) {
+	lg, _ := logger.CreateLoggerForTest(t)
+	// The same address exists under both prefixes with different infos.
+	// The parsed result must be stable across calls.
+	kvs := map[string][]byte{
+		path.Join(tidbTopologyInformationPath, "1.1.1.1:4000", infoSuffix):                                             []byte(`{"ip":"1.1.1.1","status_port":10080}`),
+		path.Join(tidbTopologyInformationPath, "1.1.1.1:4000", ttlSuffix):                                              []byte("123"),
+		path.Join(tidbKeyspaceTopologyInformationPath, "ks1", tidbTopologyInformationPath, "1.1.1.1:4000", infoSuffix): []byte(`{"ip":"9.9.9.9","status_port":10080}`),
+		path.Join(tidbKeyspaceTopologyInformationPath, "ks1", tidbTopologyInformationPath, "1.1.1.1:4000", ttlSuffix):  []byte("123"),
+	}
+	first := ParseTiDBTopology(lg, kvs)
+	require.Len(t, first, 1)
+	for i := 0; i < 50; i++ {
+		again := ParseTiDBTopology(lg, kvs)
+		require.Equal(t, first, again)
+	}
+}
