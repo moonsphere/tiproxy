@@ -5,6 +5,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -13,7 +14,9 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 	"github.com/pingcap/tiproxy/lib/util/logger"
+	"github.com/pingcap/tiproxy/pkg/discovery"
 	"github.com/pingcap/tiproxy/pkg/discovery/pb"
+	"github.com/pingcap/tiproxy/pkg/manager/infosync"
 	"github.com/pingcap/tiproxy/pkg/sctx"
 	"github.com/pingcap/tiproxy/pkg/util/etcd"
 	"github.com/prometheus/client_golang/prometheus"
@@ -118,6 +121,78 @@ func TestDiscoveryServer(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, resp.Full)
 	require.Empty(t, resp.Upserted)
+
+	require.NoError(t, server.Close())
+}
+
+func TestServerWithHubSourcedCluster(t *testing.T) {
+	restore := resetPromRegistry()
+	defer restore()
+
+	// The PD side: an etcd with one TiDB registered, watched by a hub.
+	dir := t.TempDir()
+	lg, _ := logger.CreateLoggerForTest(t)
+	etcdServer, err := etcd.CreateEtcdServer("0.0.0.0:0", dir, lg)
+	require.NoError(t, err)
+	t.Cleanup(etcdServer.Close)
+	endpoint := etcdServer.Clients[0].Addr().String()
+	etcdCli, err := etcd.InitEtcdClientWithAddrs(lg, endpoint, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, etcdCli.Close())
+	})
+	info, err := json.Marshal(&infosync.TiDBTopologyInfo{IP: "10.0.0.1", StatusPort: 10080})
+	require.NoError(t, err)
+	_, err = etcdCli.Put(context.Background(), infosync.TiDBTopologyPath+"10.0.0.1:4000/info", string(info))
+	require.NoError(t, err)
+	_, err = etcdCli.Put(context.Background(), infosync.TiDBTopologyPath+"10.0.0.1:4000/ttl", "1")
+	require.NoError(t, err)
+
+	hub := discovery.NewHub(lg.Named("hub"), etcdCli, nil)
+	hubCtx, hubCancel := context.WithCancel(context.Background())
+	hub.Run(hubCtx)
+	t.Cleanup(func() {
+		hubCancel()
+		require.NoError(t, hub.Close())
+	})
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	grpcSrv := grpc.NewServer()
+	pb.RegisterTiDBDiscoveryServer(grpcSrv, hub)
+	go func() {
+		_ = grpcSrv.Serve(lis)
+	}()
+	t.Cleanup(grpcSrv.Stop)
+
+	// The sidecar side: a full proxy server whose only cluster is hub-sourced,
+	// so it has no PD client at all.
+	configFile := dir + "/config.toml"
+	configData := fmt.Sprintf(`
+[proxy]
+pd-addrs = ""
+[[proxy.backend-clusters]]
+name = "c1"
+discovery-source = "hub"
+hub-addrs = %q
+`, lis.Addr().String())
+	require.NoError(t, os.WriteFile(configFile, []byte(configData), 0o644))
+
+	server, err := NewServer(context.Background(), &sctx.Context{
+		ConfigFile: configFile,
+	})
+	require.NoError(t, err)
+
+	// The topology pushed by the hub reaches the cluster manager.
+	require.Eventually(t, func() bool {
+		topology, err := server.clusterManager.GetTiDBTopology(context.Background())
+		if err != nil || len(topology) != 1 {
+			return false
+		}
+		for _, info := range topology {
+			return info.IP == "10.0.0.1" && info.ClusterName == "c1"
+		}
+		return false
+	}, 10*time.Second, 100*time.Millisecond)
 
 	require.NoError(t, server.Close())
 }

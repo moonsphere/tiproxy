@@ -154,6 +154,9 @@ func normalizeCluster(cluster config.BackendCluster) config.BackendCluster {
 	pdAddrs := config.SplitAddrList(cluster.PDAddrs)
 	sort.Strings(pdAddrs)
 	cluster.PDAddrs = strings.Join(pdAddrs, ",")
+	hubAddrs := config.SplitAddrList(cluster.HubAddrs)
+	sort.Strings(hubAddrs)
+	cluster.HubAddrs = strings.Join(hubAddrs, ",")
 	cluster.NSServers = slices.Clone(cluster.NSServers)
 	sort.Strings(cluster.NSServers)
 	return cluster
@@ -167,6 +170,8 @@ func clusterReusable(cluster *Cluster, cfg config.BackendCluster) bool {
 	right := normalizeCluster(cfg)
 	return left.Name == right.Name &&
 		left.PDAddrs == right.PDAddrs &&
+		left.DiscoverySource == right.DiscoverySource &&
+		left.HubAddrs == right.HubAddrs &&
 		slices.Equal(left.NSServers, right.NSServers)
 }
 

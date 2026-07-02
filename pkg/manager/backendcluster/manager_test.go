@@ -343,10 +343,10 @@ func TestManagerGetTiDBTopologySkipsUnavailableCluster(t *testing.T) {
 	mgr := NewManager(lg, nilClusterTLS)
 	mgr.mu.clusters = map[string]*Cluster{
 		"cluster-a": {
-			infoSyncer: infosync.NewInfoSyncer(lg.Named("cluster-a"), clusterA.client),
+			topo: infosync.NewInfoSyncer(lg.Named("cluster-a"), clusterA.client),
 		},
 		"cluster-b": {
-			infoSyncer: infosync.NewInfoSyncer(lg.Named("cluster-b"), clusterB.client),
+			topo: infosync.NewInfoSyncer(lg.Named("cluster-b"), clusterB.client),
 		},
 	}
 	clusterB.shutdownServer(t)
