@@ -95,6 +95,19 @@ services:
     depends_on:
       - pd
 
+  # The canary for the pd->hub->pd migration scenario, started on demand.
+  sidecar-pd:
+    image: ${TIPROXY_IMAGE:-moonsphere/tiproxy:discovery-hub}
+    entrypoint: ["/bin/tiproxy", "--config", "/etc/proxy-e2e/sidecar-pd.toml"]
+    profiles: ["canary"]
+    volumes:
+      - ./conf:/etc/proxy-e2e:ro
+    ports:
+      - "46001:6000"
+      - "43083:3080"
+    depends_on:
+      - pd
+
   sidecar:
     image: ${TIPROXY_IMAGE:-moonsphere/tiproxy:discovery-hub}
     entrypoint: ["/bin/tiproxy", "--config", "/etc/proxy-e2e/sidecar.toml"]

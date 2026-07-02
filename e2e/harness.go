@@ -30,6 +30,8 @@ const (
 	sidecarAPI     = "http://127.0.0.1:43080"
 	hub0API        = "http://127.0.0.1:43081"
 	hub1API        = "http://127.0.0.1:43082"
+	canaryDSN      = "root@tcp(127.0.0.1:46001)/test"
+	canaryAPI      = "http://127.0.0.1:43083"
 
 	// fingerprintSamples is how many connections one fingerprint round opens.
 	// Routing is score-based, not round-robin, so use enough samples to hit
@@ -56,15 +58,17 @@ func compose(t *testing.T, args ...string) string {
 	return out
 }
 
-func composeUp(t *testing.T) {
+func composeUp(t *testing.T, extra ...string) {
 	t.Helper()
-	compose(t, "up", "-d")
+	// Profile flags must precede the subcommand.
+	compose(t, append(append([]string{}, extra...), "up", "-d")...)
 	t.Cleanup(func() {
 		if os.Getenv("E2E_KEEP_CLUSTER") != "" {
 			t.Log("E2E_KEEP_CLUSTER is set, leaving the compose cluster running")
 			return
 		}
-		compose(t, "down", "-v", "--remove-orphans")
+		// All profiles must be passed or their services survive the down.
+		compose(t, "--profile", "scale", "--profile", "canary", "down", "-v", "--remove-orphans")
 	})
 }
 
@@ -76,6 +80,12 @@ func composeUp(t *testing.T) {
 // assertion goes through here: it is the client's view of the routing table.
 func fingerprint(t *testing.T) map[string]struct{} {
 	t.Helper()
+	return fingerprintDSN(sidecarDSN)
+}
+
+// fingerprintDSN is fingerprint against an arbitrary instance. It never fails
+// the test, so it is safe inside require.Eventually conditions.
+func fingerprintDSN(dsn string) map[string]struct{} {
 	hosts := make(map[string]struct{})
 	dbs := make([]*sql.DB, 0, fingerprintSamples)
 	defer func() {
@@ -84,7 +94,7 @@ func fingerprint(t *testing.T) map[string]struct{} {
 		}
 	}()
 	for i := 0; i < fingerprintSamples; i++ {
-		db, err := sql.Open("mysql", sidecarDSN+"?timeout=3s&readTimeout=3s")
+		db, err := sql.Open("mysql", dsn+"?timeout=3s&readTimeout=3s")
 		if err != nil {
 			continue
 		}
@@ -207,6 +217,70 @@ func otherHub(service string) (api, other string) {
 		return hub1API, "hub-1"
 	}
 	return hub0API, "hub-0"
+}
+
+// putConfig replaces the whole config of a tiproxy instance through its
+// admin API, which triggers an online reload (the backend cluster manager
+// rebuilds the clusters whose config changed).
+func putConfig(t *testing.T, api, tomlConfig string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, api+"/api/admin/config/", strings.NewReader(tomlConfig))
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	body, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "config PUT failed: %s", string(body))
+}
+
+// sidecarRawLogs returns the sidecar logs without failing the test, so it is
+// safe inside require.Eventually conditions.
+func sidecarRawLogs() string {
+	out, err := exec.Command("docker", "logs", composeProject+"-sidecar-1").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
+// holdConnection opens one connection through the given DSN and queries it
+// periodically until the returned stop function is called, recording errors.
+// It observes what an existing client connection experiences during an
+// online config switch.
+func holdConnection(t *testing.T, dsn string) (stop func() []error) {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn+"?timeout=3s&readTimeout=3s")
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	// Force the single connection open now.
+	var host string
+	require.NoError(t, db.QueryRow("SELECT @@hostname").Scan(&host))
+
+	var errs []error
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(300 * time.Millisecond):
+				if err := db.QueryRow("SELECT @@hostname").Scan(&host); err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
+	}()
+	return func() []error {
+		close(done)
+		<-finished
+		_ = db.Close()
+		return errs
+	}
 }
 
 func sidecarLogs(t *testing.T) string {

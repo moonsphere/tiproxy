@@ -113,3 +113,163 @@ func waitTiDBReady(t *testing.T, service string, timeout time.Duration) {
 		return err == nil && strings.Contains(out, "server is running MySQL protocol")
 	}, timeout, 2*time.Second, "%s did not become ready", service)
 }
+
+// TestHubRestartFullPush is S7: a topology change that happens while all hubs
+// are down leaves a stale entry in the sidecar cache; the full snapshot on
+// hub restart must replace the cache with no stale leftovers. The cache-level
+// observation uses the per-backend metric series, which are purged only when
+// a backend leaves the backend list (a stale-but-fenced backend still has
+// them).
+func TestHubRestartFullPush(t *testing.T) {
+	composeUp(t)
+	waitMetric(t, hub0API, "tiproxy_discovery_backends", 2, 300*time.Second)
+	waitFingerprint(t, 120*time.Second, "tidb-0", "tidb-1")
+
+	compose(t, "--profile", "scale", "up", "-d", "tidb-2")
+	waitFingerprint(t, 120*time.Second, "tidb-0", "tidb-1", "tidb-2")
+
+	// All hubs down, then the backend leaves gracefully: PD forgets it but
+	// no hub can push the removal, so the sidecar cache goes stale and the
+	// entry is only fenced by the health check.
+	compose(t, "kill", "hub-0", "hub-1")
+	compose(t, "--profile", "scale", "stop", "-t", "30", "tidb-2")
+	waitFingerprint(t, 60*time.Second, "tidb-0", "tidb-1")
+
+	// The cache-level observable: as long as the stale entry is cached, the
+	// observer keeps health-checking it and the router logs one "unhealthy
+	// backend is not in router" tick per cycle (the backend left the router
+	// long ago — it is unhealthy and connectionless). The eviction by the
+	// full snapshot is observed as the CESSATION of these ticks. (Two
+	// observables that do not work: the per-backend metric series are only
+	// GCed after hours of retention, and the router's list-removal log only
+	// fires for backends the router still tracks.)
+	require.Eventually(t, func() bool {
+		return staleTickCount() > 0
+	}, 30*time.Second, time.Second, "the stale backend must keep being health-checked while all hubs are down")
+
+	// Hubs return and bootstrap from PD, which no longer has tidb-2: the
+	// full snapshot replaces the cache and the ticks stop.
+	compose(t, "start", "hub-0", "hub-1")
+	waitMetric(t, hub0API, "tiproxy_discovery_backends", 2, 120*time.Second)
+	require.Eventually(t, func() bool {
+		return totalSubscribers(t) >= 1
+	}, 60*time.Second, time.Second, "the sidecar did not resubscribe after the hubs returned")
+
+	converged := false
+	deadline := time.Now().Add(120 * time.Second)
+	for time.Now().Before(deadline) {
+		before := staleTickCount()
+		time.Sleep(8 * time.Second) // > 2 health-check cycles
+		if staleTickCount() == before {
+			converged = true
+			break
+		}
+	}
+	require.True(t, converged, "the stale backend must be evicted from the cache after the full snapshot")
+	waitFingerprint(t, 60*time.Second, "tidb-0", "tidb-1")
+}
+
+// staleTickCount counts the health-check ticks for the stale backend in the
+// sidecar log. It never fails the test, so it is safe inside Eventually.
+func staleTickCount() int {
+	logs := sidecarRawLogs()
+	count := 0
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, "unhealthy backend is not in router") && strings.Contains(line, "tidb-2:4000") {
+			count++
+		}
+	}
+	return count
+}
+
+// TestPdHubMigration is S8: an instance running in the traditional pd mode is
+// switched to the hub mode and back through the online config API. An
+// existing client connection must not see a single error across both
+// switches, and the routing result must stay the same.
+func TestPdHubMigration(t *testing.T) {
+	composeUp(t, "--profile", "canary")
+	waitMetric(t, hub0API, "tiproxy_discovery_backends", 2, 300*time.Second)
+
+	// The canary starts in the pd mode and routes to both backends.
+	waitCanaryFingerprint(t, 120*time.Second, "tidb-0", "tidb-1")
+
+	// The config API merges the payload over the current config, so the
+	// backend-clusters array cannot be dropped by omission: the switch back
+	// must explicitly override the entry with a pd-sourced one.
+	pdMode := `
+[proxy]
+addr = "0.0.0.0:6000"
+pd-addrs = "pd:2379"
+[[proxy.backend-clusters]]
+name = "default"
+discovery-source = "pd"
+pd-addrs = "pd:2379"
+[api]
+addr = "0.0.0.0:3080"
+`
+	hubMode := `
+[proxy]
+addr = "0.0.0.0:6000"
+pd-addrs = ""
+[[proxy.backend-clusters]]
+name = "default"
+discovery-source = "hub"
+hub-addrs = "hub-0:3080,hub-1:3080"
+[api]
+addr = "0.0.0.0:3080"
+`
+	subscribersBefore := totalSubscribers(t)
+
+	// pd -> hub with a connection held open across the switch.
+	stop := holdConnection(t, canaryDSN)
+	putConfig(t, canaryAPI, hubMode)
+	require.Eventually(t, func() bool {
+		return totalSubscribers(t) == subscribersBefore+1
+	}, 60*time.Second, time.Second, "the canary did not subscribe to a hub after the switch")
+	waitCanaryFingerprint(t, 60*time.Second, "tidb-0", "tidb-1")
+	require.Empty(t, stop(), "the held connection must survive the pd->hub switch")
+
+	// hub -> pd, same contract.
+	stop = holdConnection(t, canaryDSN)
+	putConfig(t, canaryAPI, pdMode)
+	require.Eventually(t, func() bool {
+		return totalSubscribers(t) == subscribersBefore
+	}, 60*time.Second, time.Second, "the canary did not unsubscribe after switching back")
+	waitCanaryFingerprint(t, 60*time.Second, "tidb-0", "tidb-1")
+	require.Empty(t, stop(), "the held connection must survive the hub->pd switch")
+}
+
+// waitCanaryFingerprint is waitFingerprint against the canary instance.
+func waitCanaryFingerprint(t *testing.T, timeout time.Duration, want ...string) {
+	t.Helper()
+	wantSet := make(map[string]struct{}, len(want))
+	for _, w := range want {
+		wantSet[w] = struct{}{}
+	}
+	var last map[string]struct{}
+	require.Eventuallyf(t, func() bool {
+		last = fingerprintDSN(canaryDSN)
+		if len(last) != len(wantSet) {
+			return false
+		}
+		for h := range wantSet {
+			if _, ok := last[h]; !ok {
+				return false
+			}
+		}
+		return true
+	}, timeout, 2*time.Second, "want backends %v on the canary, last seen %v", want, last)
+}
+
+// totalSubscribers sums the subscriber counts over both hubs, tolerating a
+// hub that is temporarily unreachable.
+func totalSubscribers(t *testing.T) float64 {
+	t.Helper()
+	var total float64
+	for _, api := range []string{hub0API, hub1API} {
+		if v, err := metricValue(api, "tiproxy_discovery_subscribers"); err == nil {
+			total += v
+		}
+	}
+	return total
+}

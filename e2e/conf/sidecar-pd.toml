@@ -1,0 +1,11 @@
+# E2E: the canary sidecar starts in the traditional pd mode and is switched
+# to the hub mode (and back) through the config API in the migration scenario.
+[proxy]
+addr = "0.0.0.0:6000"
+pd-addrs = "pd:2379"
+
+[api]
+addr = "0.0.0.0:3080"
+
+[log]
+level = "info"

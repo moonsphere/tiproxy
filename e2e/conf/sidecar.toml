@@ -12,4 +12,5 @@ hub-addrs = "hub-0:3080,hub-1:3080"
 addr = "0.0.0.0:3080"
 
 [log]
-level = "info"
+# debug: the e2e asserts on the router debug log for backend removals.
+level = "debug"
