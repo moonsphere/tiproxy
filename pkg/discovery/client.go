@@ -79,6 +79,12 @@ func (c *HubClient) Start(ctx context.Context) {
 // the reconnect clocks of all sidecars are synchronized, and reconnecting in
 // lockstep would stampede the hubs.
 func (c *HubClient) streamLoop(ctx context.Context) {
+	// The config validation guarantees a non-empty list; guard against a
+	// direct misuse of the constructor.
+	if len(c.hubAddrs) == 0 {
+		c.lg.Error("no discovery hub address is configured, the topology will never arrive")
+		return
+	}
 	backoff := minReconnectBackoff
 	for i := 0; ctx.Err() == nil; i++ {
 		addr := c.hubAddrs[i%len(c.hubAddrs)]

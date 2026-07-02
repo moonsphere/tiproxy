@@ -71,7 +71,7 @@ func main() {
 
 			<-cmd.Context().Done()
 			if e := srv.Close(); e != nil {
-				err = errors.Wrapf(err, "shutdown with errors")
+				err = errors.Wrapf(e, "shutdown with errors")
 			}
 
 			return err

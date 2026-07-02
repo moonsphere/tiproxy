@@ -196,3 +196,25 @@ hub-addrs = %q
 
 	require.NoError(t, server.Close())
 }
+
+func TestDiscoveryServerRejectsHubSource(t *testing.T) {
+	restore := resetPromRegistry()
+	defer restore()
+
+	dir := t.TempDir()
+	configFile := dir + "/config.toml"
+	configData := `
+[proxy]
+pd-addrs = ""
+[[proxy.backend-clusters]]
+name = "c1"
+discovery-source = "hub"
+hub-addrs = "127.0.0.1:3080"
+`
+	require.NoError(t, os.WriteFile(configFile, []byte(configData), 0o644))
+
+	_, err := NewDiscoveryServer(context.Background(), &sctx.Context{
+		ConfigFile: configFile,
+	})
+	require.ErrorContains(t, err, "discovery-source=hub")
+}

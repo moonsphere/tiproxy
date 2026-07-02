@@ -151,6 +151,12 @@ func (m *Manager) syncClusters(ctx context.Context, cfg *config.Config) error {
 
 func normalizeCluster(cluster config.BackendCluster) config.BackendCluster {
 	cluster.Name = strings.TrimSpace(cluster.Name)
+	cluster.DiscoverySource = strings.TrimSpace(cluster.DiscoverySource)
+	if cluster.DiscoverySource == "" {
+		// The empty source means PD: canonicalize so that switching between
+		// the two spellings does not rebuild the cluster.
+		cluster.DiscoverySource = config.DiscoverySourcePD
+	}
 	pdAddrs := config.SplitAddrList(cluster.PDAddrs)
 	sort.Strings(pdAddrs)
 	cluster.PDAddrs = strings.Join(pdAddrs, ",")

@@ -6,6 +6,7 @@ package server
 import (
 	"context"
 
+	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	"github.com/pingcap/tiproxy/pkg/discovery"
 	"github.com/pingcap/tiproxy/pkg/manager/cert"
@@ -40,6 +41,11 @@ func NewDiscoveryServer(ctx context.Context, sctx *sctx.Context) (srv *Server, e
 	clusters := cfg.GetBackendClusters()
 	if len(clusters) != 1 {
 		err = errors.Errorf("discovery mode requires exactly one PD cluster (proxy.pd-addrs or one proxy.backend-clusters entry), got %d", len(clusters))
+		return
+	}
+	if clusters[0].DiscoverySource == config.DiscoverySourceHub {
+		// A hub must watch PD itself: subscribing to another hub is not supported.
+		err = errors.Errorf("discovery mode requires a PD-sourced cluster, but %q uses discovery-source=hub", clusters[0].Name)
 		return
 	}
 	srv.hubEtcdCli, err = etcd.InitEtcdClientWithAddrs(lg.Named("etcd"), clusters[0].PDAddrs, srv.certManager.ClusterTLS())
