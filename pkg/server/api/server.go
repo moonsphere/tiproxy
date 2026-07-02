@@ -74,7 +74,10 @@ type Server struct {
 	mgr                  Managers
 }
 
-func NewServer(cfg config.API, lg *zap.Logger, mgr Managers, handler HTTPHandler, ready *atomic.Bool) (*Server, error) {
+// newBaseServer sets up the listener, the gRPC server and the gin engine with
+// the common middlewares. It is shared by the proxy API server and the
+// discovery API server, which register different services on top of it.
+func newBaseServer(cfg config.API, lg *zap.Logger, mgr Managers, ready *atomic.Bool) (*Server, *gin.Engine, error) {
 	grpcOpts := []grpc_zap.Option{
 		grpc_zap.WithLevels(func(code codes.Code) zapcore.Level {
 			return zap.InfoLevel
@@ -100,7 +103,7 @@ func NewServer(cfg config.API, lg *zap.Logger, mgr Managers, handler HTTPHandler
 	var err error
 	h.listener, err = net.Listen("tcp", cfg.Addr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	switch cfg.ProxyProtocol {
 	case "v2":
@@ -117,6 +120,33 @@ func NewServer(cfg config.API, lg *zap.Logger, mgr Managers, handler HTTPHandler
 		h.grpcServer,
 		h.attachLogger,
 	)
+	return h, engine, nil
+}
+
+// start wraps the listener with TLS when configured and starts serving.
+func (h *Server) start(engine *gin.Engine) {
+	if tlscfg := h.mgr.CertMgr.ServerHTTPTLS(); tlscfg != nil {
+		mux := cmux.New(h.listener)
+		mux.SetReadTimeout(DefConnTimeout)
+		plainHealthListener := mux.Match(cmux.HTTP1Fast())
+		tlsListener := tls.NewListener(mux.Match(cmux.TLS()), tlscfg)
+
+		h.serveHTTP("HTTP health", plainHealthListener, h.newHTTPHealthHandler())
+		h.serveHTTP("HTTPS", tlsListener, engine.Handler())
+		h.wg.RunWithRecover(func() {
+			h.lg.Info("HTTP mux closed", zap.Error(mux.Serve()))
+		}, nil, h.lg)
+		return
+	}
+
+	h.serveHTTP("HTTP", h.listener, engine.Handler())
+}
+
+func NewServer(cfg config.API, lg *zap.Logger, mgr Managers, handler HTTPHandler, ready *atomic.Bool) (*Server, error) {
+	h, engine, err := newBaseServer(cfg, lg, mgr, ready)
+	if err != nil {
+		return nil, err
+	}
 
 	h.registerGrpc(mgr.CfgMgr)
 	h.registerAPI(engine.Group("/api"))
@@ -130,21 +160,7 @@ func NewServer(cfg config.API, lg *zap.Logger, mgr Managers, handler HTTPHandler
 		}
 	}
 
-	if tlscfg := mgr.CertMgr.ServerHTTPTLS(); tlscfg != nil {
-		mux := cmux.New(h.listener)
-		mux.SetReadTimeout(DefConnTimeout)
-		plainHealthListener := mux.Match(cmux.HTTP1Fast())
-		tlsListener := tls.NewListener(mux.Match(cmux.TLS()), tlscfg)
-
-		h.serveHTTP("HTTP health", plainHealthListener, h.newHTTPHealthHandler())
-		h.serveHTTP("HTTPS", tlsListener, engine.Handler())
-		h.wg.RunWithRecover(func() {
-			lg.Info("HTTP mux closed", zap.Error(mux.Serve()))
-		}, nil, h.lg)
-		return h, nil
-	}
-
-	h.serveHTTP("HTTP", h.listener, engine.Handler())
+	h.start(engine)
 	return h, nil
 }
 

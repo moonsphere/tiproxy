@@ -52,6 +52,14 @@ const (
 	infoSuffix = "info"
 )
 
+// Exported etcd path prefixes, shared with the discovery hub so that its
+// watch path stays consistent with the fetch path here.
+const (
+	TiDBTopologyPath         = tidbTopologyInformationPath
+	TiDBKeyspaceTopologyPath = tidbKeyspaceTopologyInformationPath
+	PromTopologyPath         = promTopologyPath
+)
+
 var (
 	ErrNoProm = errors.New("no prometheus info")
 )

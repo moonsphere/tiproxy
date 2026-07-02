@@ -10,6 +10,7 @@ import (
 
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
+	"github.com/pingcap/tiproxy/pkg/discovery"
 	"github.com/pingcap/tiproxy/pkg/manager/backendcluster"
 	"github.com/pingcap/tiproxy/pkg/manager/cert"
 	mgrcfg "github.com/pingcap/tiproxy/pkg/manager/config"
@@ -52,27 +53,21 @@ type Server struct {
 	apiServer *api.Server
 	// L7 proxy
 	proxy *proxy.SQLServer
+	// discovery hub mode only
+	hub        *discovery.Hub
+	hubEtcdCli *clientv3.Client
 }
 
-func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error) {
-	srv = &Server{
-		configManager:    mgrcfg.NewConfigManager(),
-		metricsManager:   metrics.NewMetricsManager(),
-		namespaceManager: mgrns.NewNamespaceManager(),
-		certManager:      cert.NewCertManager(),
-	}
-
-	handler := sctx.Handler
-	ready := atomic.NewBool(false)
-
+// initBase initializes the components shared by the proxy server and the
+// discovery server: config, logger, metrics and certs.
+func (srv *Server) initBase(ctx context.Context, sctx *sctx.Context) (cfg *config.Config, lg *zap.Logger, err error) {
 	// setup config manager
 	if err = srv.configManager.Init(ctx, sctx.ConfigFile, sctx.AdvertiseAddr); err != nil {
 		return
 	}
-	cfg := srv.configManager.GetConfig()
+	cfg = srv.configManager.GetConfig()
 
 	// set up logger
-	var lg *zap.Logger
 	if srv.loggerManager, lg, err = logger.NewLoggerManager(&cfg.Log); err != nil {
 		return
 	}
@@ -94,13 +89,31 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 	srv.metricsManager.Init(ctx, lg.Named("metrics"))
 	metrics.ServerEventCounter.WithLabelValues(metrics.EventStart).Inc()
 
-	srv.memManager = memory.NewMemManager(lg, srv.configManager)
-	srv.memManager.Start(ctx)
-
 	// setup certs
 	if err = srv.certManager.Init(cfg, lg.Named("cert"), srv.configManager.WatchConfig()); err != nil {
 		return
 	}
+	return
+}
+
+func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error) {
+	srv = &Server{
+		configManager:    mgrcfg.NewConfigManager(),
+		metricsManager:   metrics.NewMetricsManager(),
+		namespaceManager: mgrns.NewNamespaceManager(),
+		certManager:      cert.NewCertManager(),
+	}
+
+	handler := sctx.Handler
+	ready := atomic.NewBool(false)
+
+	cfg, lg, err := srv.initBase(ctx, sctx)
+	if err != nil {
+		return
+	}
+
+	srv.memManager = memory.NewMemManager(lg, srv.configManager)
+	srv.memManager.Start(ctx)
 
 	// setup backend cluster manager
 	srv.clusterManager = backendcluster.NewManager(lg.Named("backendcluster"), srv.certManager.ClusterTLS)
@@ -278,6 +291,12 @@ func (s *Server) Close() error {
 	}
 	if s.clusterManager != nil {
 		errs = append(errs, s.clusterManager.Close())
+	}
+	if s.hub != nil {
+		errs = append(errs, s.hub.Close())
+	}
+	if s.hubEtcdCli != nil {
+		errs = append(errs, s.hubEtcdCli.Close())
 	}
 	s.wg.Wait()
 	return errors.Collect(ErrCloseServer, errs...)

@@ -30,7 +30,9 @@ func (h *Server) DebugHealth(c *gin.Context) {
 	} else if h.isClosing.Load() {
 		status = http.StatusBadGateway
 		health.UnhealthyReason = "server is closing"
-	} else if !h.mgr.NsMgr.Ready() {
+	} else if h.mgr.NsMgr != nil && !h.mgr.NsMgr.Ready() {
+		// NsMgr is nil in the discovery server, whose readiness is already
+		// gated by the readyState middleware.
 		status = http.StatusBadGateway
 		health.UnhealthyReason = "server is not ready"
 	}
