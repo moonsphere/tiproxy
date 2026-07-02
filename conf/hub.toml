@@ -1,0 +1,45 @@
+# The config template for running TiProxy as a discovery hub:
+#
+#   tiproxy discovery --config /etc/proxy/hub.toml
+#
+# The hub watches the TiDB topology of one PD cluster and pushes it to
+# sidecar TiProxy instances over gRPC, so that the sidecars do not need to
+# connect to PD directly. See docs/design/discovery-hub.md and
+# docs/design/discovery-hub-ops.md.
+#
+# On the sidecar side, subscribe to the hubs with:
+#
+#   [[proxy.backend-clusters]]
+#   name = "default"
+#   discovery-source = "hub"
+#   hub-addrs = "hub-host-1:3080,hub-host-2:3080"
+
+# workdir = "./work"
+
+[proxy]
+# The PD cluster whose TiDB topology this hub serves. The discovery mode
+# requires exactly one PD-sourced cluster.
+# Note: when unset, it DEFAULTS to "127.0.0.1:2379"; always set it explicitly
+# in real deployments.
+# pd-addrs = "127.0.0.1:2379"
+
+[api]
+# The hub serves the TiDBDiscovery gRPC service, the gRPC health service,
+# metrics and debug endpoints on this address. Point the sidecars'
+# hub-addrs here.
+# addr = "0.0.0.0:3080"
+
+[log]
+# level = "info"
+
+[security]
+# The hub serves TLS from [security.server-http-tls] and the sidecars
+# connect with [security.cluster-tls], consistent with how components
+# access each other's API ports. Configure both sides or neither: an
+# asymmetric TLS configuration fails fast with a reconnect loop (see the
+# troubleshooting section of the operations guide).
+# [security.server-http-tls]
+#   ca = ""
+#   cert = ""
+#   key = ""
+#   auto-certs = false
