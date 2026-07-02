@@ -119,8 +119,12 @@ func (ts *hubTestSuite) putTiDB(sqlAddr, keyspace, ip string, statusPort uint) {
 	require.NoError(ts.t, err)
 }
 
-func (ts *hubTestSuite) deleteTTL(sqlAddr string) {
-	_, err := ts.testCli.Delete(context.Background(), path.Join(infosync.TiDBTopologyPath, sqlAddr, "ttl"))
+func (ts *hubTestSuite) deleteTTL(sqlAddr, keyspace string) {
+	key := path.Join(infosync.TiDBTopologyPath, sqlAddr, "ttl")
+	if keyspace != "" {
+		key = path.Join(infosync.TiDBKeyspaceTopologyPath, keyspace, key)
+	}
+	_, err := ts.testCli.Delete(context.Background(), key)
 	require.NoError(ts.t, err)
 }
 
@@ -218,7 +222,7 @@ func TestHubDeltaUpsertAndRemove(t *testing.T) {
 	require.Empty(t, resp.RemovedAddrs)
 
 	// Deleting the ttl key (lease expiry on tidb down) triggers a removal.
-	ts.deleteTTL("3.3.3.3:4000")
+	ts.deleteTTL("3.3.3.3:4000", "")
 	resp = recvWithTimeout(t, stream)
 	require.False(t, resp.Full)
 	require.Empty(t, resp.Upserted)
@@ -267,7 +271,7 @@ func TestHubCacheConsistency(t *testing.T) {
 	for i := range 10 {
 		ts.putTiDB(fmt.Sprintf("7.7.7.%d:4000", i), "", fmt.Sprintf("7.7.7.%d", i), 10080)
 	}
-	ts.deleteTTL("7.7.7.0:4000")
+	ts.deleteTTL("7.7.7.0:4000", "")
 
 	// Apply the full snapshot and all deltas to a local cache. The result
 	// must converge to the actual topology: full first, deltas strictly newer.

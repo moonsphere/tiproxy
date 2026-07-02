@@ -396,3 +396,30 @@ func TestGetBackendClusters(t *testing.T) {
 	cfg.Proxy.PDAddrs = ""
 	require.Nil(t, cfg.GetBackendClusters())
 }
+
+func TestBackendClusterDiscoverySource(t *testing.T) {
+	newCfg := func(cluster BackendCluster) *Config {
+		cfg := NewConfig()
+		cfg.Proxy.BackendClusters = []BackendCluster{cluster}
+		return cfg
+	}
+
+	// The default source requires pd-addrs.
+	require.NoError(t, newCfg(BackendCluster{Name: "c1", PDAddrs: "127.0.0.1:2379"}).Check())
+	require.ErrorIs(t, newCfg(BackendCluster{Name: "c1"}).Check(), ErrInvalidConfigValue)
+
+	// The hub source requires hub-addrs and ignores pd-addrs.
+	require.NoError(t, newCfg(BackendCluster{Name: "c1", DiscoverySource: DiscoverySourceHub, HubAddrs: "127.0.0.1:3080"}).Check())
+	require.NoError(t, newCfg(BackendCluster{Name: "c1", DiscoverySource: DiscoverySourceHub, HubAddrs: "127.0.0.1:3080,127.0.0.2:3080"}).Check())
+	require.ErrorIs(t, newCfg(BackendCluster{Name: "c1", DiscoverySource: DiscoverySourceHub}).Check(), ErrInvalidConfigValue)
+	require.ErrorIs(t, newCfg(BackendCluster{Name: "c1", DiscoverySource: DiscoverySourceHub, HubAddrs: "bad_addr"}).Check(), ErrInvalidConfigValue)
+
+	// Unknown sources are rejected.
+	require.ErrorIs(t, newCfg(BackendCluster{Name: "c1", DiscoverySource: "etcd", PDAddrs: "127.0.0.1:2379"}).Check(), ErrInvalidConfigValue)
+
+	// VIP requires a PD connection, so it cannot work with hub clusters.
+	cfg := newCfg(BackendCluster{Name: "c1", DiscoverySource: DiscoverySourceHub, HubAddrs: "127.0.0.1:3080"})
+	cfg.HA.VirtualIP = "127.0.0.1/24"
+	cfg.HA.Interface = "eth0"
+	require.ErrorIs(t, cfg.Check(), ErrInvalidConfigValue)
+}

@@ -241,6 +241,12 @@ func (br *BackendReader) ReadMetrics(ctx context.Context) error {
 
 // Query all owners, including zone owner and global owner.
 func (br *BackendReader) queryAllOwners(ctx context.Context) (zones, owners []string, err error) {
+	// Without etcd (a hub-sourced cluster) there is no owner election at all.
+	// Returning no owners makes every member read the metrics directly from
+	// the backends through the missing-metrics path.
+	if br.etcdCli == nil {
+		return nil, nil, nil
+	}
 	// Get all owner keys.
 	opts := []clientv3.OpOption{clientv3.WithPrefix()}
 	var kvs []*mvccpb.KeyValue

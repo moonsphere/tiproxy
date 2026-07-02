@@ -26,6 +26,15 @@ var (
 
 const DefaultBackendClusterName = "default"
 
+// Discovery sources of a backend cluster.
+const (
+	// DiscoverySourcePD watches the TiDB topology from PD (etcd) directly.
+	DiscoverySourcePD = "pd"
+	// DiscoverySourceHub subscribes to a discovery hub (`tiproxy discovery`)
+	// instead of connecting to PD.
+	DiscoverySourceHub = "hub"
+)
+
 type Config struct {
 	Proxy               ProxyServer           `yaml:"proxy,omitempty" toml:"proxy,omitempty" json:"proxy,omitempty"`
 	API                 API                   `yaml:"api,omitempty" toml:"api,omitempty" json:"api,omitempty"`
@@ -91,6 +100,14 @@ type BackendCluster struct {
 	Name      string   `yaml:"name,omitempty" toml:"name,omitempty" json:"name,omitempty" reloadable:"true"`
 	PDAddrs   string   `yaml:"pd-addrs,omitempty" toml:"pd-addrs,omitempty" json:"pd-addrs,omitempty" reloadable:"true"`
 	NSServers []string `yaml:"ns-servers,omitempty" toml:"ns-servers,omitempty" json:"ns-servers,omitempty" reloadable:"true"`
+	// DiscoverySource selects where the TiDB topology of this cluster comes from:
+	// "pd" (default): watch PD (etcd) directly.
+	// "hub": subscribe to a discovery hub (`tiproxy discovery`). The cluster
+	// then has no PD client at all, which is designed for sidecar deployments.
+	DiscoverySource string `yaml:"discovery-source,omitempty" toml:"discovery-source,omitempty" json:"discovery-source,omitempty" reloadable:"true"`
+	// HubAddrs is the comma-separated list of discovery hub addresses.
+	// Required when discovery-source is "hub".
+	HubAddrs string `yaml:"hub-addrs,omitempty" toml:"hub-addrs,omitempty" json:"hub-addrs,omitempty" reloadable:"true"`
 }
 
 type API struct {
@@ -232,6 +249,15 @@ func (cfg *Config) Check() error {
 	if cfg.HA.GARPRefreshCount < 0 {
 		return errors.Wrapf(ErrInvalidConfigValue, "ha.garp-refresh-count must be greater than or equal to 0")
 	}
+	if cfg.HA.VirtualIP != "" {
+		// VIP ownership is elected through the PD etcd, which a hub-sourced
+		// cluster does not connect to.
+		for _, cluster := range cfg.GetBackendClusters() {
+			if cluster.DiscoverySource == DiscoverySourceHub {
+				return errors.Wrapf(ErrInvalidConfigValue, "ha.virtual-ip cannot work with discovery-source=hub clusters")
+			}
+		}
+	}
 
 	return nil
 }
@@ -314,8 +340,17 @@ func (ps *ProxyServer) Check() error {
 			return errors.Wrapf(ErrInvalidConfigValue, "duplicate proxy.backend-clusters name %s", name)
 		}
 		clusterNames[name] = struct{}{}
-		if err := validateAddrList(cluster.PDAddrs, "proxy.backend-clusters.pd-addrs"); err != nil {
-			return err
+		switch cluster.DiscoverySource {
+		case "", DiscoverySourcePD:
+			if err := validateAddrList(cluster.PDAddrs, "proxy.backend-clusters.pd-addrs"); err != nil {
+				return err
+			}
+		case DiscoverySourceHub:
+			if err := validateAddrList(cluster.HubAddrs, "proxy.backend-clusters.hub-addrs"); err != nil {
+				return err
+			}
+		default:
+			return errors.Wrapf(ErrInvalidConfigValue, "invalid proxy.backend-clusters[%d].discovery-source %s, supported: pd, hub", i, cluster.DiscoverySource)
 		}
 		if _, err := ParseNSServers(cluster.NSServers); err != nil {
 			return errors.Wrapf(ErrInvalidConfigValue, "invalid proxy.backend-clusters.ns-servers: %s", err.Error())

@@ -11,6 +11,7 @@ import (
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	"github.com/pingcap/tiproxy/pkg/balance/metricsreader"
+	"github.com/pingcap/tiproxy/pkg/discovery"
 	"github.com/pingcap/tiproxy/pkg/manager/infosync"
 	"github.com/pingcap/tiproxy/pkg/util/etcd"
 	httputil "github.com/pingcap/tiproxy/pkg/util/http"
@@ -19,14 +20,25 @@ import (
 	"go.uber.org/zap"
 )
 
+// topoSource provides the TiDB topology of one cluster. It is either an
+// InfoSyncer (discovery-source=pd, watching PD directly) or a discovery
+// HubClient (discovery-source=hub, subscribing to a discovery hub).
+type topoSource interface {
+	GetTiDBTopology(context.Context) (map[string]*infosync.TiDBTopologyInfo, error)
+	GetPromInfo(context.Context) (*infosync.PrometheusInfo, error)
+	Close() error
+}
+
 // Cluster is the cluster-scoped container for one backend PD cluster.
 type Cluster struct {
-	cfg        config.BackendCluster
-	etcdCli    *clientv3.Client
-	infoSyncer *infosync.InfoSyncer
-	metrics    *metricsreader.ClusterReader
-	httpCli    *httputil.Client
-	dialer     *netutil.DNSDialer
+	cfg config.BackendCluster
+	// etcdCli is nil when discovery-source is "hub": the cluster then has no
+	// PD client at all.
+	etcdCli *clientv3.Client
+	topo    topoSource
+	metrics *metricsreader.ClusterReader
+	httpCli *httputil.Client
+	dialer  *netutil.DNSDialer
 }
 
 func (c *Cluster) Config() config.BackendCluster {
@@ -38,11 +50,11 @@ func (c *Cluster) EtcdClient() *clientv3.Client {
 }
 
 func (c *Cluster) GetTiDBTopology(ctx context.Context) (map[string]*infosync.TiDBTopologyInfo, error) {
-	return c.infoSyncer.GetTiDBTopology(ctx)
+	return c.topo.GetTiDBTopology(ctx)
 }
 
 func (c *Cluster) GetPromInfo(ctx context.Context) (*infosync.PrometheusInfo, error) {
-	return c.infoSyncer.GetPromInfo(ctx)
+	return c.topo.GetPromInfo(ctx)
 }
 
 func (c *Cluster) HTTPClient() *httputil.Client {
@@ -64,8 +76,10 @@ func (c *Cluster) Close() error {
 		c.metrics.Close()
 	}
 	errs := []error{
-		c.infoSyncer.Close(),
-		c.etcdCli.Close(),
+		c.topo.Close(),
+	}
+	if c.etcdCli != nil {
+		errs = append(errs, c.etcdCli.Close())
 	}
 	return errors.Collect(errors.New("close backend cluster"), errs...)
 }
@@ -87,32 +101,47 @@ func NewCluster(
 	}
 	dialer := netutil.NewDNSDialer(nameServers)
 	httpCli := httputil.NewHTTPClientWithDialContext(clusterTLS, dialer.DialContext)
+	clusterLogger := logger.With(zap.String("cluster", clusterCfg.Name))
 
-	etcdCli, err := etcd.InitEtcdClientWithAddrsAndDialer(
-		logger.With(zap.String("cluster", clusterCfg.Name)).Named("etcd"),
-		clusterCfg.PDAddrs,
-		clusterTLS(),
-		dialer,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	infoSyncer := infosync.NewInfoSyncer(logger.With(zap.String("cluster", clusterCfg.Name)).Named("infosync"), etcdCli)
-	if err := infoSyncer.Init(ctx, cfg); err != nil {
-		if closeErr := etcdCli.Close(); closeErr != nil {
-			logger.Warn("close cluster etcd client failed after infosync init error",
-				zap.String("cluster", clusterCfg.Name), zap.Error(closeErr))
+	var topo topoSource
+	var etcdCli *clientv3.Client
+	switch clusterCfg.DiscoverySource {
+	case config.DiscoverySourceHub:
+		// The topology comes from a discovery hub and the cluster has no PD
+		// client at all. This must branch on the source explicitly: PDAddrs
+		// has a default value, so it may be non-empty even in hub mode.
+		hubClient := discovery.NewHubClient(clusterCfg.HubAddrs, cfg.Proxy.AdvertiseAddr, clusterTLS, clusterLogger.Named("hubcli"))
+		hubClient.Start(ctx)
+		topo = hubClient
+	default: // config.DiscoverySourcePD
+		var err error
+		etcdCli, err = etcd.InitEtcdClientWithAddrsAndDialer(
+			clusterLogger.Named("etcd"),
+			clusterCfg.PDAddrs,
+			clusterTLS(),
+			dialer,
+		)
+		if err != nil {
+			return nil, err
 		}
-		return nil, err
+
+		infoSyncer := infosync.NewInfoSyncer(clusterLogger.Named("infosync"), etcdCli)
+		if err := infoSyncer.Init(ctx, cfg); err != nil {
+			if closeErr := etcdCli.Close(); closeErr != nil {
+				logger.Warn("close cluster etcd client failed after infosync init error",
+					zap.String("cluster", clusterCfg.Name), zap.Error(closeErr))
+			}
+			return nil, err
+		}
+		topo = infoSyncer
 	}
 
 	cluster := &Cluster{
-		cfg:        clusterCfg,
-		etcdCli:    etcdCli,
-		infoSyncer: infoSyncer,
-		httpCli:    httpCli,
-		dialer:     dialer,
+		cfg:     clusterCfg,
+		etcdCli: etcdCli,
+		topo:    topo,
+		httpCli: httpCli,
+		dialer:  dialer,
 	}
 	cluster.metrics = metricsreader.NewClusterReader(
 		logger.With(zap.String("cluster", clusterCfg.Name)).Named("metrics"),
@@ -128,10 +157,12 @@ func NewCluster(
 		cluster.metrics.AddQueryExpr(key, query.expr, query.rule)
 	}
 	if err := cluster.metrics.Start(ctx); err != nil {
-		_ = infoSyncer.Close()
-		if closeErr := etcdCli.Close(); closeErr != nil {
-			logger.Warn("close cluster etcd client failed after metrics init error",
-				zap.String("cluster", clusterCfg.Name), zap.Error(closeErr))
+		_ = topo.Close()
+		if etcdCli != nil {
+			if closeErr := etcdCli.Close(); closeErr != nil {
+				logger.Warn("close cluster etcd client failed after metrics init error",
+					zap.String("cluster", clusterCfg.Name), zap.Error(closeErr))
+			}
 		}
 		return nil, err
 	}
