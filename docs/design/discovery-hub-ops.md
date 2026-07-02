@@ -123,7 +123,28 @@ Sidecar 侧无新指标；hub 断连体现在日志
 （`the subscription to the discovery hub is broken, reconnecting`）与后端列表停止
 更新。
 
-## 7. 容量参考
+## 7. 排障
+
+**症状：sidecar 反复打 `the subscription to the discovery hub is broken, reconnecting`，拓扑不更新。**
+
+按序排查：
+
+1. hub 是否 ready：`grpc_health_v1` SERVING / `tiproxy_discovery_backends` 正常。
+   hub 连不上 PD 时永不 ready，所有订阅被 readiness 拒绝。
+2. 网络可达：sidecar 能否连通 `hub-addrs`。
+3. **TLS 配置是否对称**：hub 侧 api TLS 用 `security.server-http-tls`，sidecar 侧
+   HubClient 用 `security.cluster-ssl`（与集群内组件互访 api 的既有配对一致）。
+   任一侧单边开 TLS，连接会被立刻重置（cmux 不匹配明文 h2c / TLS 握手打进明文
+   端口），表现就是这个快速重连循环 —— 这是有意的 fail-fast，不要通过在 TLS 端
+   点上放行明文 gRPC 来"修复"。
+
+**症状：sidecar 后端列表长期为空，日志有 `the discovery hub has not pushed a topology snapshot yet`。**
+
+订阅从未成功建立（见上），或 hub 侧拓扑本身为空
+（`tiproxy_discovery_backends == 0`，检查 PD 里 `/topology/tidb/` 是否有存活
+TiDB）。
+
+## 8. 容量参考
 
 - 单 hub fan-out：单元测试中 200 订阅者 × 全量+增量 <1s（`TestHubManySubscribers`）。
   生产按 N/K 每副本数百订阅者规划，瓶颈在 gRPC 连接数而非 CPU（稳态零广播，见设计
