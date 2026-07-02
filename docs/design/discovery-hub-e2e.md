@@ -77,8 +77,8 @@ TiDB×2**（两台 TiDB 才能断言路由分布与摘除）。
 
 | # | 场景 | 步骤 | 断言 | 时限 |
 |---|---|---|---|---|
-| S7 | Hub 重启 full 重推 | hub 宕机期间缩容 tidb-2（制造 sidecar 缓存 stale）→ 重启 hub | full 替换后 stale 后端从指纹消失（无残留）；`rebootstrap` 无异常增长 | 60s |
-| S8 | 灰度热切换 | sidecar-pd（pd 模式）改配置为 hub 模式 → SIGHUP/接口 reload → 再切回 | 两次切换期间 SQL 零错误；切换后指纹集合不变 | 每次 30s |
+| S7 | Hub 重启 full 重推 | hub 宕机期间缩容 tidb-2（制造 sidecar 缓存 stale）→ 重启 hub | 缓存驱逐的观测 = 该 stale 后端健康检查 tick（debug 日志 `unhealthy backend is not in router`）的**停止**；宕机期间 tick 持续增长为正向对照。⚠️ 两个不可用的观测：per-backend metrics 序列（2h retention GC 才清）、router 的 list-removal 日志（只对 router 仍持有的后端触发，被围栏且无连接的早已不在 router） | 120s |
+| S8 | 灰度热切换 | sidecar-pd（pd 模式）经 `PUT /api/admin/config/` 切 hub 模式 → 再切回 | 切换前持有的连接跨两次切换零错误；hub `subscribers` 总数 ±1 证实真切换；指纹集合不变。⚠️ 配置接口是 **merge 语义**（TOML 数组缺席=保留旧值），回切必须显式给 pd-source 的 backend-clusters 条目 | 每次 60s |
 
 ### P2 —— 规模与价值验证（后续，可选）
 
@@ -98,6 +98,7 @@ e2e/
 ```
 
 - **build tag 隔离**：`//go:build e2e`，`go test ./...` 不受影响。
+- sidecar 日志级别为 debug：S7 的缓存驱逐断言依赖 router 的 debug tick。
 - 运行：`make e2e` → 构建镜像（复用 `make docker`）→ `go test -tags e2e ./e2e/
   -v -timeout 30m`。测试自己 `compose up/down`（`t.Cleanup` 保证残局清理）。
 - 镜像版本：`TIPROXY_IMAGE` 环境变量注入，默认 `moonsphere/tiproxy:discovery-hub`；
