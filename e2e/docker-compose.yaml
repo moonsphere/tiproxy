@@ -23,6 +23,10 @@ services:
       - --addr=0.0.0.0:20160
       - --advertise-addr=tikv:20160
       - --status-addr=0.0.0.0:20180
+      # Declare a small capacity so that a nearly-full host disk does not
+      # trip the low-space protection (the e2e writes megabytes at most);
+      # otherwise raft stops proposing and TiDB fails bootstrap.
+      - --capacity=10GB
     depends_on:
       - pd
 

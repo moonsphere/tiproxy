@@ -8,22 +8,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	nethttp "net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/pingcap/tiproxy/lib/util/logger"
 	"github.com/pingcap/tiproxy/pkg/discovery"
-	"github.com/pingcap/tiproxy/pkg/discovery/pb"
 	"github.com/pingcap/tiproxy/pkg/manager/infosync"
 	"github.com/pingcap/tiproxy/pkg/sctx"
 	"github.com/pingcap/tiproxy/pkg/util/etcd"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 func TestServer(t *testing.T) {
@@ -102,25 +101,25 @@ func TestDiscoveryServer(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// The server turns ready after the first topology bootstrap.
-	conn, err := grpc.NewClient(apiAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = conn.Close()
-	})
-	healthCli := healthpb.NewHealthClient(conn)
+	// The server turns ready after the first topology bootstrap, then the
+	// topology endpoint serves a (here empty) snapshot.
 	require.Eventually(t, func() bool {
-		resp, err := healthCli.Check(context.Background(), &healthpb.HealthCheckRequest{})
-		return err == nil && resp.Status == healthpb.HealthCheckResponse_SERVING
+		resp, err := nethttp.Get("http://" + apiAddr + "/api/topology")
+		if err != nil {
+			return false
+		}
+		defer func() {
+			_ = resp.Body.Close()
+		}()
+		if resp.StatusCode != nethttp.StatusOK {
+			return false
+		}
+		var topo discovery.TopologyResponse
+		if err := json.NewDecoder(resp.Body).Decode(&topo); err != nil {
+			return false
+		}
+		return len(topo.Backends) == 0 && resp.Header.Get("ETag") != ""
 	}, 10*time.Second, 100*time.Millisecond)
-
-	// Subscribing returns a full (empty) topology snapshot.
-	stream, err := pb.NewTiDBDiscoveryClient(conn).Subscribe(context.Background(), &pb.SubscribeRequest{ClientId: "test"})
-	require.NoError(t, err)
-	resp, err := stream.Recv()
-	require.NoError(t, err)
-	require.True(t, resp.Full)
-	require.Empty(t, resp.Upserted)
 
 	require.NoError(t, server.Close())
 }
@@ -155,14 +154,11 @@ func TestServerWithHubSourcedCluster(t *testing.T) {
 		hubCancel()
 		require.NoError(t, hub.Close())
 	})
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	grpcSrv := grpc.NewServer()
-	pb.RegisterTiDBDiscoveryServer(grpcSrv, hub)
-	go func() {
-		_ = grpcSrv.Serve(lis)
-	}()
-	t.Cleanup(grpcSrv.Stop)
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	engine.Group("api").GET("/topology", hub.HandleTopology)
+	hubSrv := httptest.NewServer(engine.Handler())
+	t.Cleanup(hubSrv.Close)
 
 	// The sidecar side: a full proxy server whose only cluster is hub-sourced,
 	// so it has no PD client at all.
@@ -174,7 +170,7 @@ pd-addrs = ""
 name = "c1"
 discovery-source = "hub"
 hub-addrs = %q
-`, lis.Addr().String())
+`, hubSrv.Listener.Addr().String())
 	require.NoError(t, os.WriteFile(configFile, []byte(configData), 0o644))
 
 	server, err := NewServer(context.Background(), &sctx.Context{

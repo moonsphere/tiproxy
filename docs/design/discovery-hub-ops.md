@@ -111,34 +111,38 @@ Hub 侧指标（`/metrics`，前缀 `tiproxy_discovery_`）：
 
 | 指标 | 含义 | 告警建议 |
 |---|---|---|
-| `subscribers` | 当前订阅者数 | 明显低于 sidecar 数 → sidecar 连不上 |
+| `requests_total{code}` | 拓扑请求数(200/304/503) | 200 速率异常高 → 拓扑抖动或 client 拿不到 304;503 持续 → hub 连不上 PD |
 | `backends` | 快照内存活 TiDB 数 | 与实际 TiDB 数不符 / 各 hub 副本间不一致 |
 | `revision` | 快照对应的 etcd revision | 各副本间长期差距大 → 某副本 watch 落后 |
 | `rebootstrap_total` | watch 重建次数 | 持续增长 → PD 连接不稳 / compaction 频繁 |
-| `sub_dropped_total` | 慢订阅者被断次数 | 持续增长 → sidecar 消费不动或网络差 |
-| `broadcast_total{type}` | full/delta 广播次数 | delta 速率异常高 → 拓扑抖动 |
 
 PromQL 示例：
 
 ```promql
 # 各 hub 副本 revision 偏差
 max(tiproxy_discovery_revision) - min(tiproxy_discovery_revision)
-# 订阅者掉线率
-rate(tiproxy_discovery_sub_dropped_total[5m])
+# 轮询健康度: 304 占比应接近 1
+rate(tiproxy_discovery_requests_total{code="304"}[5m])
 # watch 重建频率
 rate(tiproxy_discovery_rebootstrap_total[15m])
+```
+
+随手查拓扑（可观测性是这个传输选型的核心动因）:
+
+```
+curl -s hub:3080/api/topology | jq .
 ```
 
 Grafana 面板：待 grafonnet 工具链接入后补进 `tiproxy_summary.jsonnet`
 （Discovery row，上表 6 个指标）。
 
 Sidecar 侧无新指标；hub 断连体现在日志
-（`the subscription to the discovery hub is broken, reconnecting`）与后端列表停止
+（`polling the discovery hub failed, rotating to the next hub`）与后端列表停止
 更新。
 
 ## 7. 排障
 
-**症状：sidecar 反复打 `the subscription to the discovery hub is broken, reconnecting`，拓扑不更新。**
+**症状：sidecar 反复打 `polling the discovery hub failed, rotating to the next hub`，拓扑不更新。**
 
 按序排查：
 
@@ -147,13 +151,12 @@ Sidecar 侧无新指标；hub 断连体现在日志
 2. 网络可达：sidecar 能否连通 `hub-addrs`。
 3. **TLS 配置是否对称**：hub 侧 api TLS 用 `[security.server-http-tls]`，sidecar
    侧 HubClient 用 `[security.cluster-tls]`（与集群内组件互访 api 的既有配对一致）。
-   任一侧单边开 TLS，连接会被立刻重置（cmux 不匹配明文 h2c / TLS 握手打进明文
-   端口），表现就是这个快速重连循环 —— 这是有意的 fail-fast，不要通过在 TLS 端
-   点上放行明文 gRPC 来"修复"。
+   任一侧单边开 TLS，连接会被立刻重置（TLS 握手/明文错配直接连接失败），
+   表现就是这个快速轮换循环 —— 有意的 fail-fast。
 
-**症状：sidecar 后端列表长期为空，日志有 `the discovery hub has not pushed a topology snapshot yet`。**
+**症状：sidecar 后端列表长期为空，日志有 `the discovery hub has not served a topology snapshot yet`。**
 
-订阅从未成功建立（见上），或 hub 侧拓扑本身为空
+轮询从未成功（见上），或 hub 侧拓扑本身为空
 （`tiproxy_discovery_backends == 0`，检查 PD 里 `/topology/tidb/` 是否有存活
 TiDB）。
 

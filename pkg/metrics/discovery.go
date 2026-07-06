@@ -8,28 +8,17 @@ import (
 )
 
 const (
-	LblBroadcastType = "type"
-
-	BroadcastTypeFull  = "full"
-	BroadcastTypeDelta = "delta"
+	LblStatusCode = "code"
 )
 
 var (
-	DiscoverySubscribersGauge = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Namespace: ModuleProxy,
-			Subsystem: LabelDiscovery,
-			Name:      "subscribers",
-			Help:      "Number of current subscribers of the discovery hub.",
-		})
-
-	DiscoverySubDroppedCounter = prometheus.NewCounter(
+	DiscoveryRequestCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: ModuleProxy,
 			Subsystem: LabelDiscovery,
-			Name:      "sub_dropped_total",
-			Help:      "Number of subscribers dropped because they consume too slowly.",
-		})
+			Name:      "requests_total",
+			Help:      "Number of topology requests served by the discovery hub, by status code.",
+		}, []string{LblStatusCode})
 
 	DiscoveryRevisionGauge = prometheus.NewGauge(
 		prometheus.GaugeOpts{
@@ -54,12 +43,4 @@ var (
 			Name:      "rebootstrap_total",
 			Help:      "Number of times the topology watch is re-established from a full read.",
 		})
-
-	DiscoveryBroadcastCounter = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: ModuleProxy,
-			Subsystem: LabelDiscovery,
-			Name:      "broadcast_total",
-			Help:      "Number of topology broadcasts to subscribers.",
-		}, []string{LblBroadcastType})
 )

@@ -110,7 +110,7 @@ func NewCluster(
 		// The topology comes from a discovery hub and the cluster has no PD
 		// client at all. This must branch on the source explicitly: PDAddrs
 		// has a default value, so it may be non-empty even in hub mode.
-		hubClient := discovery.NewHubClient(clusterCfg.HubAddrs, cfg.Proxy.AdvertiseAddr, clusterTLS, clusterLogger.Named("hubcli"))
+		hubClient := discovery.NewHubClient(clusterCfg.HubAddrs, clusterTLS, clusterLogger.Named("hubcli"))
 		hubClient.Start(ctx)
 		topo = hubClient
 	default: // config.DiscoverySourcePD

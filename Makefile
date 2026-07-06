@@ -64,16 +64,6 @@ lint: golangci-lint tidy header
 gocovmerge:
 	GOBIN=$(GOBIN) $(GO) install github.com/djshow832/gocovmerge@master
 
-# The plugin versions are pinned for reproducible generation:
-# protoc-gen-go matches the protobuf runtime in go.mod and protoc-gen-go-grpc
-# v1.3.0 generates code compatible with the grpc-go version in go.mod.
-gen-proto:
-	GOBIN=$(GOBIN) $(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.6
-	GOBIN=$(GOBIN) $(GO) install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.3.0
-	PATH="$(GOBIN):$$PATH" protoc --go_out=. --go_opt=paths=source_relative \
-		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
-		pkg/discovery/pb/tidb_discovery.proto
-
 tidy:
 	cd lib && $(GO) mod tidy
 	$(GO) mod tidy

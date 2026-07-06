@@ -1,5 +1,13 @@
 # TiProxy Discovery Hub 设计（sidecar mesh）
 
+> **传输层修订（2026-07-06）**：v1 传输从 gRPC 服务端流改为 **HTTP 轮询 + ETag**。
+> 动因：控制面对延迟不敏感（sidecar 侧本来就有 3s 健康检查周期），但对**可观测性
+> 极度敏感** —— HTTP 端点可以 curl 直查、零客户端依赖；且轮询消灭了推送模型的全部
+> 自带复杂度（订阅者管理、慢消费者、delta 协议、重连续传语义、proto 工具链），hub
+> 变**无状态**。文中 F4/F9/F12/F17 等推送模型的发现随传输层一并成为历史，保留作设
+> 计记录。升级路径：GET 加 `?wait=30s` 即 long polling（etcd watch 的祖师爷模型），
+> 协议前向兼容。
+
 ## 1. 背景与问题
 
 把 TiProxy 作为 per-pod sidecar 部署（service mesh）意味着 N≈1000 个 TiProxy 实
@@ -28,8 +36,8 @@ etcd 同时扛 TSO、region 元数据、调度，这些 linearizable 读会跟�
 ## 2. 方案：Hub 控制面（xDS / Istio-pilot 模型）
 
 插入一层薄控制面（Discovery Hub）。hub 只 watch PD **一次**（每个 hub 副本一次），
-把拓扑通过流式 gRPC 推给 sidecar。sidecar 永不碰 PD。PD 的 watch 消费者从 N（1000）
-降到 K（hub 副本数，≈3）。
+以 HTTP + ETag 供 sidecar 轮询（详见 §6）。sidecar 永不碰 PD。PD 的 watch 消费者从
+N（1000）降到 K（hub 副本数，≈3）。
 
 ```
         ┌─────────── PD (embedded etcd) ───────────┐
@@ -40,7 +48,7 @@ etcd 同时扛 TSO、region 元数据、调度，这些 linearizable 读会跟�
         │  Hub 副本 1    │  ...   │  Hub 副本 K    │   K≈3, HA
         │  snapshot+rev  │        │  snapshot+rev  │
         └───────▲───────┘        └───────▲───────┘
-                │ gRPC 流 (push)          │
+                │ HTTP 轮询 + ETag(304)    │
    ┌────────────┼─────────────┬───────────┼───────────┐
    │            │             │           │           │
  sidecar-1   sidecar-2  ...  sidecar-i ... sidecar-N   (N≈1000)
@@ -48,7 +56,8 @@ etcd 同时扛 TSO、region 元数据、调度，这些 linearizable 读会跟�
  (本地缓存；GetTiDBTopology 读缓存)
 ```
 
-tidb 拓扑变化 → K 个 etcd watch 事件 → 内存 fan-out 给 N 个 sidecar，PD 零额外负载。
+tidb 拓扑变化 → K 个 etcd watch 事件 → hub 内容/ETag 更新,N 个 sidecar 下一轮轮询
+拿到新拓扑,PD 零额外负载。稳态 = N 次空 304 往返 / 3s,由 K 台 hub 分摊。
 
 ### 为什么方案 A（tiproxy 运行模式）起步
 
@@ -59,11 +68,8 @@ hub 的宿主有两个候选：**A** = tiproxy 二进制的一个运行模式（
   不跨团队评审直接上，快速拿 PD 负载下降数据。
 - **B 是长期正解**：PD 已有微服务框架、`services <mode>` 子命令、MetaStorage etcd
   封装、HA，dashboard 也在读 `/topology/*`。
-- **关键**：proto 是稳定契约。v1 先放本仓库（免跨仓依赖），但 **proto package 名
-  `tidb_discoverypb` 定死不改** —— gRPC 方法全名
-  `/tidb_discoverypb.TiDBDiscovery/Subscribe` 由 proto package 决定，与 Go import
-  路径无关。未来 A→B 时把 `.proto` 上移 kvproto、重新生成，**线协议零变化**，
-  sidecar 只把 `hub-addrs` 重新指向。
+- **关键**：线协议是稳定契约 —— `GET /api/topology` 的 JSON 字段名（§6）。未来
+  A→B 时 server 换宿主，路径与 JSON 不变，sidecar 只把 `hub-addrs` 重新指向。
 
 本文档设计 **A**。
 
@@ -107,7 +113,7 @@ type topoSource interface {   // *infosync.InfoSyncer 和 *discovery.HubClient �
 `NewCluster`（`cluster.go:74`）按该集群的 `discovery-source` 配置装 `InfoSyncer`
 （现状）或 `HubClient`（新）。**Manager、nsMgr、observer、router、跨集群合并逻辑
 全部零改动** —— 它们只见 `Cluster.GetTiDBTopology`。sidecar 保留 3s observer 节奏
-用于**健康检查**；但 `GetTiDBTopology` 变成读一个由 hub 推送保持新鲜的本地缓存。
+用于**健康检查**；但 `GetTiDBTopology` 变成读一个由轮询保持新鲜的本地缓存。
 
 多集群与 hub 的关系天然对齐：**一个 hub 服务一个 PD 集群**；sidecar 的每个
 `BackendCluster` 条目独立选 `pd` 或 `hub`。`TiDBTopologyInfo.ClusterName` 是本地
@@ -156,7 +162,7 @@ rootCmd.AddCommand(discoveryCmd)   // 复用同一套 --config/--advertise-addr 
 | certManager | ✅ | ✅ |
 | etcdCli 连 PD | ✅（per-cluster，在 clusterManager 内） | ✅（自建，`etcd.InitEtcdClient`） |
 | **Hub**（watch + fan-out） | — | ✅ **新增** |
-| gRPC/HTTP listener（`cfg.API.Addr`） | api.Server（完整） | 精简：gRPC(TiDBDiscovery+health)+/metrics+/debug |
+| HTTP listener（`cfg.API.Addr`） | api.Server（完整） | 精简：/api/topology + diagnostics + /metrics + /debug |
 | infoSyncer 写入循环 | ✅ | ❌（hub 不注册自己） |
 | metricsReader / namespaceManager / proxy SQLServer / replay / meter / vip | ✅ | ❌ |
 
@@ -345,50 +351,35 @@ func (h *Hub) broadcast(resp *pb.DiscoveryResponse) {
 Prometheus 信息：一个小 `promLoop`（复用 `GetPromInfo` 或 watch
 `/topology/prometheus`）更新 `h.prom`，捎带在下一条响应里。
 
-## 6. 传输协议 —— 放本仓库（`pkg/discovery/pb/tidb_discovery.proto`）
+## 6. 传输协议 —— HTTP + JSON（`GET /api/topology`）
 
-v1 先放 tiproxy 仓库：免跨仓依赖、免 `replace` 指令、免 kvproto 上游评审，独立
-迭代。**约束一条：`package tidb_discoverypb;` 定死不改** —— gRPC 方法全名由 proto
-package 决定（`/tidb_discoverypb.TiDBDiscovery/Subscribe`），与 Go import 路径无
-关。未来迁 PD（方案 B）时把 `.proto` 原样上移 kvproto（它已有
-`meta_storagepb/`、`tsopb/` 先例）、各自重新生成，线协议零变化。
+传输刻意选最朴素的形态：
 
-```proto
-syntax = "proto3";
-package tidb_discoverypb;   // 定死：决定 gRPC 方法全名，上移 kvproto 时不变
-option go_package = "github.com/pingcap/tiproxy/pkg/discovery/pb";
-
-service TiDBDiscovery {
-  rpc Subscribe(SubscribeRequest) returns (stream DiscoveryResponse);
-}
-message SubscribeRequest {
-  repeated string keyspaces = 1;   // 空 = 全部
-  int64  known_revision   = 2;     // 续传提示；0 = 需要全量
-  string client_id        = 3;
-}
-message DiscoveryResponse {
-  int64  revision            = 1;
-  bool   full                = 2;  // true：替换缓存；false：应用 delta
-  repeated TiDBInstance upserted = 3;
-  repeated string removed_addrs  = 4;
-  PrometheusInfo prometheus      = 5;
-}
-message TiDBInstance {
-  string addr = 1; string ip = 2; uint32 status_port = 3;
-  map<string,string> labels = 4; string keyspace = 5; string version = 6;
-}
-message PrometheusInfo { string ip = 1; int32 port = 2; string binary_path = 3; }
+```
+GET /api/topology
+  If-None-Match: <etag>        # 可选;匹配则 304 空转
+→ 200 OK
+  ETag: <内容 hash>
+  {"revision": 254674,
+   "backends": [{"addr":"10.0.0.1:4000","ip":"10.0.0.1","status_port":10080,
+                 "labels":{"zone":"z1"},"keyspace":"ks1"}],
+   "prometheus": {"ip":"...","port":9090}}
+→ 304 Not Modified             # 内容未变,空 body
+→ 503                          # 尚未完成首次 bootstrap
 ```
 
-> **字段审计（已验证）**：下游只消费 `Labels/IP/StatusPort`
->（`PDFetcher.GetBackendList`）+ `IP/StatusPort`（`backend_reader.go:556`）。
-> `GitHash/DeployPath/StartTimestamp` 无人使用，可丢弃。`Keyspace/Version` 保留做前
-> 向兼容。
+- **ETag = 响应内容的 fnv64a hash**,不是本地计数器 —— client 在 hub 副本间
+  failover 时,计数器会碰撞产生假 304(实测抓到的 bug);内容 hash 跨副本语义天然
+  正确,内容相同回 304 反而是合法优化。
+- client 每 3s 轮询,steady state = 一次空 304 往返;sticky 在当前 hub,失败轮换下
+  一个地址。fleet 的轮询时钟天然错开(启动时间不同),无惊群。
+- JSON 字段名是协议契约,保持稳定;server 未来迁 PD 宿主时 client 不变。
+- v2 升级:`GET /api/topology?wait=30s` long polling —— rev 变了立即返回,否则超
+  时 304,协议前向兼容。
+- 可观测性:`curl hub:3080/api/topology` 随手查拓扑;`tiproxy_discovery_requests_total{code}`
+  看轮询健康度。
 
-生成的 `.pb.go` 提交进仓库（tiproxy 无 proto 工具链，加一个 `make gen-proto`
-target，见实现文档 PR2）。
-
-## 7. gRPC 注册接口 —— `pkg/server/api`
+## 7. 路由注册 —— `pkg/server/api`
 
 API server 已把 gRPC+HTTP 复用在一个 listener 上并注册了 `diagnosticspb`
 （`server.go:188`）。加一个用于精简 discovery profile 的兄弟构造函数：
