@@ -131,12 +131,10 @@ func init() {
 		CrossLocationBytesCounter,
 		ReplayPendingCmdsGauge,
 		ReplayWaitTime,
-		DiscoverySubscribersGauge,
-		DiscoverySubDroppedCounter,
+		DiscoveryRequestCounter,
 		DiscoveryRevisionGauge,
 		DiscoveryBackendsGauge,
 		DiscoveryRebootstrapCounter,
-		DiscoveryBroadcastCounter,
 	}
 }
 

@@ -192,33 +192,6 @@ func waitMetric(t *testing.T, api, name string, want float64, timeout time.Durat
 	}, timeout, time.Second, "want %s=%v on %s, last %v", name, want, api, last)
 }
 
-// subscribedHub returns the API address and service name of the hub that the
-// sidecar is currently subscribed to.
-func subscribedHub(t *testing.T) (api, service string) {
-	t.Helper()
-	require.Eventually(t, func() bool {
-		v0, err0 := metricValue(hub0API, "tiproxy_discovery_subscribers")
-		v1, err1 := metricValue(hub1API, "tiproxy_discovery_subscribers")
-		switch {
-		case err0 == nil && v0 > 0:
-			api, service = hub0API, "hub-0"
-			return true
-		case err1 == nil && v1 > 0:
-			api, service = hub1API, "hub-1"
-			return true
-		}
-		return false
-	}, 30*time.Second, time.Second, "no hub reports a subscriber")
-	return api, service
-}
-
-func otherHub(service string) (api, other string) {
-	if service == "hub-0" {
-		return hub1API, "hub-1"
-	}
-	return hub0API, "hub-0"
-}
-
 // putConfig replaces the whole config of a tiproxy instance through its
 // admin API, which triggers an online reload (the backend cluster manager
 // rebuilds the clusters whose config changed).
@@ -288,4 +261,14 @@ func sidecarLogs(t *testing.T) string {
 	out, err := exec.Command("docker", "logs", composeProject+"-sidecar-1").CombinedOutput()
 	require.NoError(t, err)
 	return string(out)
+}
+
+// serviceLogCount counts occurrences of a substring in a service's logs
+// without failing the test.
+func serviceLogCount(service, substr string) int {
+	out, err := exec.Command("docker", "logs", composeProject+"-"+service+"-1").CombinedOutput()
+	if err != nil {
+		return 0
+	}
+	return strings.Count(string(out), substr)
 }

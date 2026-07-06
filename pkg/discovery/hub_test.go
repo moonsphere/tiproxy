@@ -7,26 +7,24 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"path"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/pingcap/tiproxy/lib/util/logger"
-	"github.com/pingcap/tiproxy/pkg/discovery/pb"
 	"github.com/pingcap/tiproxy/pkg/manager/cert"
 	"github.com/pingcap/tiproxy/pkg/manager/infosync"
 	"github.com/pingcap/tiproxy/pkg/metrics"
 	"github.com/pingcap/tiproxy/pkg/util/etcd"
-	"github.com/pingcap/tiproxy/pkg/util/waitgroup"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/server/v3/embed"
 	"go.uber.org/zap"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 )
 
 const testRecvTimeout = 3 * time.Second
@@ -38,7 +36,7 @@ type hubTestSuite struct {
 	testCli *clientv3.Client
 	hubCli  *clientv3.Client
 	hub     *Hub
-	grpcSrv *grpc.Server
+	httpSrv *httptest.Server
 	addr    string
 	ready   chan struct{}
 	cancel  context.CancelFunc
@@ -79,21 +77,25 @@ func newHubTestSuite(t *testing.T) *hubTestSuite {
 		require.Fail(t, "hub is not ready in time")
 	}
 
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	ts.addr = lis.Addr().String()
-	ts.grpcSrv = grpc.NewServer()
-	pb.RegisterTiDBDiscoveryServer(ts.grpcSrv, ts.hub)
-	go func() {
-		_ = ts.grpcSrv.Serve(lis)
-	}()
+	ts.httpSrv = startHubHTTPServer(t, ts.hub)
+	ts.addr = ts.httpSrv.Listener.Addr().String()
 	return ts
+}
+
+// startHubHTTPServer serves the hub's topology endpoint like the discovery
+// API server does.
+func startHubHTTPServer(t *testing.T, hub *Hub) *httptest.Server {
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	engine.Group("api").GET("/topology", hub.HandleTopology)
+	srv := httptest.NewServer(engine.Handler())
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 func (ts *hubTestSuite) close() {
 	ts.cancel()
 	require.NoError(ts.t, ts.hub.Close())
-	ts.grpcSrv.Stop()
 	require.NoError(ts.t, ts.testCli.Close())
 	// hubCli may be closed by tests already.
 	_ = ts.hubCli.Close()
@@ -129,213 +131,155 @@ func (ts *hubTestSuite) deleteTTL(sqlAddr, keyspace string) {
 	require.NoError(ts.t, err)
 }
 
-func (ts *hubTestSuite) subscribe(ctx context.Context) pb.TiDBDiscovery_SubscribeClient {
-	conn, err := grpc.NewClient(ts.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	require.NoError(ts.t, err)
-	ts.t.Cleanup(func() {
-		_ = conn.Close()
-	})
-	stream, err := pb.NewTiDBDiscoveryClient(conn).Subscribe(ctx, &pb.SubscribeRequest{ClientId: "test"})
-	require.NoError(ts.t, err)
-	return stream
-}
-
-func recvWithTimeout(t *testing.T, stream pb.TiDBDiscovery_SubscribeClient) *pb.DiscoveryResponse {
-	type result struct {
-		resp *pb.DiscoveryResponse
-		err  error
+// getTopology fetches the endpoint once. It never fails the test, so it is
+// safe inside require.Eventually conditions.
+func (ts *hubTestSuite) getTopology(etag string) (status int, topo *TopologyResponse, newEtag string) {
+	req, err := http.NewRequest(http.MethodGet, "http://"+ts.addr+"/api/topology", nil)
+	if err != nil {
+		return 0, nil, ""
 	}
-	ch := make(chan result, 1)
-	go func() {
-		resp, err := stream.Recv()
-		ch <- result{resp, err}
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, ""
+	}
+	defer func() {
+		_ = resp.Body.Close()
 	}()
-	select {
-	case r := <-ch:
-		require.NoError(t, r.err)
-		return r.resp
-	case <-time.After(testRecvTimeout):
-		require.Fail(t, "no message received in time")
-		return nil
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, resp.Header.Get("ETag")
 	}
-}
-
-func assertNoMessage(t *testing.T, stream pb.TiDBDiscovery_SubscribeClient, wait time.Duration) {
-	ch := make(chan *pb.DiscoveryResponse, 1)
-	go func() {
-		resp, err := stream.Recv()
-		if err == nil {
-			ch <- resp
+	if resp.StatusCode == http.StatusOK {
+		var t TopologyResponse
+		if err := json.Unmarshal(body, &t); err == nil {
+			topo = &t
 		}
-	}()
-	select {
-	case resp := <-ch:
-		require.Fail(t, "unexpected message", "%+v", resp)
-	case <-time.After(wait):
 	}
+	return resp.StatusCode, topo, resp.Header.Get("ETag")
 }
 
-func TestHubBootstrapAndSubscribe(t *testing.T) {
+// waitBackends waits until the endpoint serves exactly the given addresses.
+func (ts *hubTestSuite) waitBackends(addrs ...string) *TopologyResponse {
+	var last *TopologyResponse
+	require.Eventuallyf(ts.t, func() bool {
+		status, topo, _ := ts.getTopology("")
+		if status != http.StatusOK || topo == nil {
+			return false
+		}
+		last = topo
+		if len(topo.Backends) != len(addrs) {
+			return false
+		}
+		for i, addr := range addrs {
+			if topo.Backends[i].Addr != addr {
+				return false
+			}
+		}
+		return true
+	}, testRecvTimeout, 10*time.Millisecond, "want backends %v, last %+v", addrs, last)
+	return last
+}
+
+func TestHubBootstrapAndServe(t *testing.T) {
 	ts := newHubTestSuite(t)
 	t.Cleanup(ts.close)
 	ts.putTiDB("1.1.1.1:4000", "", "1.1.1.1", 10080)
 	ts.putTiDB("2.2.2.2:4000", "ks1", "2.2.2.2", 10080)
 
-	// The subscriber always receives a full snapshot first.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	require.Eventually(t, func() bool {
-		ts.hub.mu.RLock()
-		defer ts.hub.mu.RUnlock()
-		return len(ts.hub.mu.snap) == 2
-	}, testRecvTimeout, 10*time.Millisecond)
+	// Sorted by address, with all the wire fields.
+	topo := ts.waitBackends("1.1.1.1:4000", "2.2.2.2:4000")
+	require.Equal(t, "1.1.1.1", topo.Backends[0].IP)
+	require.Equal(t, uint(10080), topo.Backends[0].StatusPort)
+	require.Equal(t, map[string]string{"zone": "z1"}, topo.Backends[0].Labels)
+	require.Equal(t, "ks1", topo.Backends[1].Keyspace)
+	require.Positive(t, topo.Revision)
 
-	stream := ts.subscribe(ctx)
-	resp := recvWithTimeout(t, stream)
-	require.True(t, resp.Full)
-	require.Len(t, resp.Upserted, 2)
-	// Sorted by address.
-	require.Equal(t, "1.1.1.1:4000", resp.Upserted[0].Addr)
-	require.Equal(t, "1.1.1.1", resp.Upserted[0].Ip)
-	require.Equal(t, uint32(10080), resp.Upserted[0].StatusPort)
-	require.Equal(t, map[string]string{"zone": "z1"}, resp.Upserted[0].Labels)
-	require.Equal(t, "2.2.2.2:4000", resp.Upserted[1].Addr)
-	require.Equal(t, "ks1", resp.Upserted[1].Keyspace)
+	// A matching If-None-Match answers 304 with no body.
+	status, _, etag := ts.getTopology("")
+	require.Equal(t, http.StatusOK, status)
+	require.NotEmpty(t, etag)
+	status, topo, newEtag := ts.getTopology(etag)
+	require.Equal(t, http.StatusNotModified, status)
+	require.Nil(t, topo)
+	require.Equal(t, etag, newEtag)
 }
 
-func TestHubDeltaUpsertAndRemove(t *testing.T) {
+func TestHubContentChange(t *testing.T) {
 	ts := newHubTestSuite(t)
 	t.Cleanup(ts.close)
 	ts.putTiDB("1.1.1.1:4000", "", "1.1.1.1", 10080)
+	ts.waitBackends("1.1.1.1:4000")
+	_, _, etag := ts.getTopology("")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	stream := ts.subscribe(ctx)
-	resp := recvWithTimeout(t, stream)
-	require.True(t, resp.Full)
-
-	// A new tidb triggers an upsert delta.
+	// A new tidb changes the content: the old ETag no longer matches.
 	ts.putTiDB("3.3.3.3:4000", "", "3.3.3.3", 10080)
-	resp = recvWithTimeout(t, stream)
-	require.False(t, resp.Full)
-	require.Len(t, resp.Upserted, 1)
-	require.Equal(t, "3.3.3.3:4000", resp.Upserted[0].Addr)
-	require.Empty(t, resp.RemovedAddrs)
+	require.Eventually(t, func() bool {
+		status, topo, _ := ts.getTopology(etag)
+		return status == http.StatusOK && topo != nil && len(topo.Backends) == 2
+	}, testRecvTimeout, 10*time.Millisecond)
 
-	// Deleting the ttl key (lease expiry on tidb down) triggers a removal.
+	// Deleting the ttl key (lease expiry on tidb down) removes the backend.
 	ts.deleteTTL("3.3.3.3:4000", "")
-	resp = recvWithTimeout(t, stream)
-	require.False(t, resp.Full)
-	require.Empty(t, resp.Upserted)
-	require.Equal(t, []string{"3.3.3.3:4000"}, resp.RemovedAddrs)
+	ts.waitBackends("1.1.1.1:4000")
 }
 
 func TestHubTTLRefreshSuppressed(t *testing.T) {
 	ts := newHubTestSuite(t)
 	t.Cleanup(ts.close)
 	ts.putTiDB("1.1.1.1:4000", "", "1.1.1.1", 10080)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	stream := ts.subscribe(ctx)
-	resp := recvWithTimeout(t, stream)
-	require.True(t, resp.Full)
-
-	// Wait until the hub has caught up with the initial writes.
-	require.Eventually(t, func() bool {
-		ts.hub.mu.RLock()
-		defer ts.hub.mu.RUnlock()
-		return len(ts.hub.mu.snap) == 1
-	}, testRecvTimeout, 10*time.Millisecond)
+	ts.waitBackends("1.1.1.1:4000")
+	_, _, etag := ts.getTopology("")
 	parseCnt := ts.hub.ParseCount()
 
 	// Simulate the periodic syncTopology of tidb: identical info, new ttl
-	// timestamp. The snapshot cannot change, so nothing is broadcast and
-	// the snapshot is not re-derived.
+	// timestamp. The content cannot change, so the ETag stays, the pollers
+	// keep getting 304 and the snapshot is not re-derived.
 	for range 5 {
 		ts.putTiDB("1.1.1.1:4000", "", "1.1.1.1", 10080)
 	}
-	assertNoMessage(t, stream, 300*time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
+	status, _, newEtag := ts.getTopology(etag)
+	require.Equal(t, http.StatusNotModified, status)
+	require.Equal(t, etag, newEtag)
 	require.Equal(t, parseCnt, ts.hub.ParseCount())
 }
 
-func TestHubCacheConsistency(t *testing.T) {
-	ts := newHubTestSuite(t)
-	t.Cleanup(ts.close)
-	ts.putTiDB("1.1.1.1:4000", "", "1.1.1.1", 10080)
+func TestHubNotBootstrapped(t *testing.T) {
+	lg, _ := logger.CreateLoggerForTest(t)
+	hub := NewHub(lg, nil, nil)
+	srv := startHubHTTPServer(t, hub)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	stream := ts.subscribe(ctx)
-
-	// A burst of writes concurrent with the subscription.
-	for i := range 10 {
-		ts.putTiDB(fmt.Sprintf("7.7.7.%d:4000", i), "", fmt.Sprintf("7.7.7.%d", i), 10080)
-	}
-	ts.deleteTTL("7.7.7.0:4000", "")
-
-	// Apply the full snapshot and all deltas to a local cache. The result
-	// must converge to the actual topology: full first, deltas strictly newer.
-	cache := make(map[string]*pb.TiDBInstance)
-	require.Eventually(t, func() bool {
-		resp := recvWithTimeout(t, stream)
-		if resp.Full {
-			clear(cache)
-		}
-		for _, inst := range resp.Upserted {
-			cache[inst.Addr] = inst
-		}
-		for _, addr := range resp.RemovedAddrs {
-			delete(cache, addr)
-		}
-		return len(cache) == 10 && cache["7.7.7.0:4000"] == nil && cache["7.7.7.9:4000"] != nil
-	}, testRecvTimeout, time.Millisecond)
+	resp, err := http.Get(srv.URL + "/api/topology")
+	require.NoError(t, err)
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 }
 
-func TestHubSlowSubscriberDropped(t *testing.T) {
+func TestHubPromPiggyback(t *testing.T) {
 	ts := newHubTestSuite(t)
 	t.Cleanup(ts.close)
 	ts.putTiDB("1.1.1.1:4000", "", "1.1.1.1", 10080)
+	ts.waitBackends("1.1.1.1:4000")
+	_, _, etag := ts.getTopology("")
+
+	prom := &infosync.PrometheusInfo{IP: "9.9.9.9", Port: 9090}
+	data, err := json.Marshal(prom)
+	require.NoError(t, err)
+	_, err = ts.testCli.Put(context.Background(), infosync.PromTopologyPath, string(data))
+	require.NoError(t, err)
+
+	// The prometheus change bumps the version even though the etcd topology
+	// revision is unchanged.
 	require.Eventually(t, func() bool {
-		ts.hub.mu.RLock()
-		defer ts.hub.mu.RUnlock()
-		return len(ts.hub.mu.snap) == 1
+		status, topo, _ := ts.getTopology(etag)
+		return status == http.StatusOK && topo != nil && topo.Prometheus != nil &&
+			topo.Prometheus.IP == "9.9.9.9" && topo.Prometheus.Port == 9090
 	}, testRecvTimeout, 10*time.Millisecond)
-
-	// A subscriber that never drains its channel.
-	slowSub, fullResp := ts.hub.register()
-	require.NotNil(t, slowSub)
-	require.NotNil(t, fullResp)
-
-	// More broadcasts than the channel capacity force a drop.
-	for i := range subChanCap + 2 {
-		ts.putTiDB(fmt.Sprintf("8.8.8.%d:4000", i), "", fmt.Sprintf("8.8.8.%d", i), 10080)
-	}
-
-	require.Eventually(t, func() bool {
-		ts.hub.mu.RLock()
-		defer ts.hub.mu.RUnlock()
-		_, ok := ts.hub.mu.subs[slowSub.id]
-		return !ok
-	}, testRecvTimeout, 10*time.Millisecond)
-	// The channel is closed after draining the buffered messages.
-	drained := false
-	for !drained {
-		select {
-		case _, ok := <-slowSub.ch:
-			drained = !ok
-		case <-time.After(testRecvTimeout):
-			require.Fail(t, "channel is not closed")
-		}
-	}
-
-	// A healthy subscriber is not affected.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	stream := ts.subscribe(ctx)
-	resp := recvWithTimeout(t, stream)
-	require.True(t, resp.Full)
-	require.Len(t, resp.Upserted, subChanCap+3)
 }
 
 func TestHubRebootstrapOnClientClose(t *testing.T) {
@@ -359,130 +303,35 @@ func TestHubRebootstrapOnClientClose(t *testing.T) {
 	require.Equal(t, parseCnt, ts.hub.ParseCount())
 }
 
-func TestHubFullRespCached(t *testing.T) {
-	ts := newHubTestSuite(t)
-	t.Cleanup(ts.close)
-	ts.putTiDB("1.1.1.1:4000", "", "1.1.1.1", 10080)
-	require.Eventually(t, func() bool {
-		ts.hub.mu.RLock()
-		defer ts.hub.mu.RUnlock()
-		return len(ts.hub.mu.snap) == 1
-	}, testRecvTimeout, 10*time.Millisecond)
-
-	// The full response is cached: all subscribers share one instance until
-	// the snapshot changes.
-	sub1, full1 := ts.hub.register()
-	sub2, full2 := ts.hub.register()
-	require.Same(t, full1, full2)
-	ts.hub.deregister(sub1)
-	ts.hub.deregister(sub2)
-
-	ts.putTiDB("2.2.2.2:4000", "", "2.2.2.2", 10080)
-	require.Eventually(t, func() bool {
-		sub3, full3 := ts.hub.register()
-		defer ts.hub.deregister(sub3)
-		return full3 != full1 && len(full3.Upserted) == 2
-	}, testRecvTimeout, 10*time.Millisecond)
-}
-
-func TestHubPromPiggyback(t *testing.T) {
-	ts := newHubTestSuite(t)
-	t.Cleanup(ts.close)
-	ts.putTiDB("1.1.1.1:4000", "", "1.1.1.1", 10080)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	stream := ts.subscribe(ctx)
-	resp := recvWithTimeout(t, stream)
-	require.True(t, resp.Full)
-
-	prom := &infosync.PrometheusInfo{IP: "9.9.9.9", Port: 9090}
-	data, err := json.Marshal(prom)
-	require.NoError(t, err)
-	_, err = ts.testCli.Put(context.Background(), infosync.PromTopologyPath, string(data))
-	require.NoError(t, err)
-
-	// The prometheus change is piggybacked as a delta.
-	resp = recvWithTimeout(t, stream)
-	require.False(t, resp.Full)
-	require.Empty(t, resp.Upserted)
-	require.Equal(t, "9.9.9.9", resp.Prometheus.Ip)
-	require.Equal(t, int32(9090), resp.Prometheus.Port)
-
-	// A new subscriber gets it in the full snapshot.
-	stream2 := ts.subscribe(ctx)
-	resp = recvWithTimeout(t, stream2)
-	require.True(t, resp.Full)
-	require.Equal(t, "9.9.9.9", resp.Prometheus.Ip)
-}
-
-func TestHubNotBootstrapped(t *testing.T) {
-	lg, _ := logger.CreateLoggerForTest(t)
-	hub := NewHub(lg, nil, nil)
-	sub, fullResp := hub.register()
-	require.Nil(t, sub)
-	require.Nil(t, fullResp)
-
-	// The gRPC handler rejects subscriptions before the first bootstrap.
-	err := hub.Subscribe(&pb.SubscribeRequest{}, nil)
-	require.Error(t, err)
-	_, ok := status.FromError(err)
-	require.True(t, ok)
-}
-
-// TestHubManySubscribers is a small-scale load test: many concurrent
-// subscribers all receive the full snapshot and subsequent deltas.
-func TestHubManySubscribers(t *testing.T) {
+// TestHubManySubscribers is a small-scale load test: many concurrent pollers
+// all see the topology, and the steady state is served from the cached bytes.
+func TestHubManyPollers(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skip the load test in short mode")
 	}
 	ts := newHubTestSuite(t)
 	t.Cleanup(ts.close)
 	ts.putTiDB("1.1.1.1:4000", "", "1.1.1.1", 10080)
-	require.Eventually(t, func() bool {
-		ts.hub.mu.RLock()
-		defer ts.hub.mu.RUnlock()
-		return len(ts.hub.mu.snap) == 1
-	}, testRecvTimeout, 10*time.Millisecond)
+	ts.waitBackends("1.1.1.1:4000")
 
-	const subscribers = 200
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	conn, err := grpc.NewClient(ts.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = conn.Close()
-	})
-	cli := pb.NewTiDBDiscoveryClient(conn)
-
-	type subState struct {
-		stream pb.TiDBDiscovery_SubscribeClient
+	const pollers = 200
+	done := make(chan error, pollers)
+	for i := 0; i < pollers; i++ {
+		go func() {
+			status, topo, etag := ts.getTopology("")
+			if status != http.StatusOK || topo == nil || len(topo.Backends) != 1 {
+				done <- fmt.Errorf("poller got status %d topo %+v", status, topo)
+				return
+			}
+			status, _, _ = ts.getTopology(etag)
+			if status != http.StatusNotModified {
+				done <- fmt.Errorf("poller got status %d for a matching etag", status)
+				return
+			}
+			done <- nil
+		}()
 	}
-	subs := make([]subState, subscribers)
-	for i := range subs {
-		stream, err := cli.Subscribe(ctx, &pb.SubscribeRequest{ClientId: fmt.Sprintf("load-%d", i)})
-		require.NoError(t, err)
-		subs[i].stream = stream
-		resp := recvWithTimeout(t, stream)
-		require.True(t, resp.Full)
-		require.Len(t, resp.Upserted, 1)
+	for i := 0; i < pollers; i++ {
+		require.NoError(t, <-done)
 	}
-	ts.hub.mu.RLock()
-	require.Len(t, ts.hub.mu.subs, subscribers)
-	ts.hub.mu.RUnlock()
-
-	// One topology change fans out to every subscriber.
-	ts.putTiDB("2.2.2.2:4000", "", "2.2.2.2", 10080)
-	var wg waitgroup.WaitGroup
-	for i := range subs {
-		stream := subs[i].stream
-		wg.Run(func() {
-			resp := recvWithTimeout(t, stream)
-			require.False(t, resp.Full)
-			require.Len(t, resp.Upserted, 1)
-			require.Equal(t, "2.2.2.2:4000", resp.Upserted[0].Addr)
-		}, ts.lg)
-	}
-	wg.Wait()
 }

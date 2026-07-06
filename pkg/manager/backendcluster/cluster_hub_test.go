@@ -5,20 +5,19 @@ package backendcluster
 
 import (
 	"context"
-	"net"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/pkg/discovery"
-	"github.com/pingcap/tiproxy/pkg/discovery/pb"
 	"github.com/pingcap/tiproxy/pkg/manager/infosync"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc"
 )
 
 // startTestHub runs a discovery hub against the given etcd cluster and
-// returns its gRPC address.
+// returns its HTTP address.
 func startTestHub(t *testing.T, pd *managerTestEtcdCluster) string {
 	lg := zapLoggerForTest(t)
 	hub := discovery.NewHub(lg.Named("hub"), pd.client, nil)
@@ -29,15 +28,12 @@ func startTestHub(t *testing.T, pd *managerTestEtcdCluster) string {
 		require.NoError(t, hub.Close())
 	})
 
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	grpcSrv := grpc.NewServer()
-	pb.RegisterTiDBDiscoveryServer(grpcSrv, hub)
-	go func() {
-		_ = grpcSrv.Serve(lis)
-	}()
-	t.Cleanup(grpcSrv.Stop)
-	return lis.Addr().String()
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	engine.Group("api").GET("/topology", hub.HandleTopology)
+	srv := httptest.NewServer(engine.Handler())
+	t.Cleanup(srv.Close)
+	return srv.Listener.Addr().String()
 }
 
 func TestManagerWithHubSourcedCluster(t *testing.T) {

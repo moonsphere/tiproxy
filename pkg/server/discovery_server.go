@@ -16,8 +16,6 @@ import (
 	"github.com/pingcap/tiproxy/pkg/server/api"
 	"github.com/pingcap/tiproxy/pkg/util/etcd"
 	"go.uber.org/atomic"
-	"google.golang.org/grpc/health"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 // NewDiscoveryServer creates a server that runs as a discovery hub: it
@@ -54,15 +52,13 @@ func NewDiscoveryServer(ctx context.Context, sctx *sctx.Context) (srv *Server, e
 	}
 
 	// The server is ready only after the first topology bootstrap, so that
-	// the readiness probe keeps subscribers away from an empty hub.
-	healthSrv := health.NewServer()
-	healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
+	// the readiness probe (GET /api/topology or /debug/health) keeps the
+	// pollers away from an empty hub.
 	srv.hub = discovery.NewHub(lg.Named("hub"), srv.hubEtcdCli, func() {
 		ready.Toggle()
-		healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	})
 	srv.hub.Run(ctx)
 
-	srv.apiServer, err = api.NewDiscoveryServer(cfg.API, lg.Named("api"), srv.configManager, srv.certManager, srv.hub, healthSrv, ready)
+	srv.apiServer, err = api.NewDiscoveryServer(cfg.API, lg.Named("api"), srv.configManager, srv.certManager, srv.hub, ready)
 	return
 }

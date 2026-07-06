@@ -7,15 +7,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"hash/fnv"
 	"maps"
+	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	"github.com/pingcap/tiproxy/lib/util/retry"
-	"github.com/pingcap/tiproxy/pkg/discovery/pb"
 	"github.com/pingcap/tiproxy/pkg/manager/infosync"
 	"github.com/pingcap/tiproxy/pkg/metrics"
 	"github.com/pingcap/tiproxy/pkg/util/etcd"
@@ -24,15 +27,9 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 const (
-	// subChanCap is the buffer size of each subscriber channel. When the
-	// buffer overflows, the subscriber is dropped and has to re-subscribe.
-	subChanCap = 16
-
 	// ttlKeySuffix and infoKeySuffix are the suffixes of the full etcd keys,
 	// e.g. /topology/tidb/{addr}/ttl.
 	ttlKeySuffix  = "/ttl"
@@ -44,11 +41,13 @@ const (
 	logInterval            = 10
 )
 
-// Hub watches the TiDB topology of one PD cluster and pushes it to
-// subscribers. It is the server side of the TiDBDiscovery service.
+// Hub watches the TiDB topology of one PD cluster and serves it over plain
+// HTTP + JSON (GET /api/topology). The transport is deliberately the simplest
+// possible one: a control plane is insensitive to latency but extremely
+// sensitive to observability, and an HTTP endpoint can be inspected with curl
+// and polled with no client dependencies. Freshness is negotiated with
+// ETag/If-None-Match, so a steady-state poll is one empty 304 round trip.
 type Hub struct {
-	pb.UnimplementedTiDBDiscoveryServer
-
 	etcdCli *clientv3.Client
 	lg      *zap.Logger
 	wg      waitgroup.WaitGroup
@@ -73,18 +72,18 @@ type Hub struct {
 		// updates always build a new map with new pointers.
 		snap map[string]*infosync.TiDBTopologyInfo
 		prom *infosync.PrometheusInfo
-		rev  int64
-		// fullResp is the cached full snapshot response shared by all new
-		// subscribers. It is rebuilt whenever snap or prom changes.
-		fullResp *pb.DiscoveryResponse
-		subs     map[int64]*subscriber
-		nextID   int64
+		// rev is the etcd revision the snapshot is derived from
+		// (informational).
+		rev int64
+		// respJSON is the serialized TopologyResponse, rebuilt on every
+		// content change and shared by all requests.
+		respJSON []byte
+		// etag is a hash of respJSON. A content hash (not a local counter)
+		// so that it stays meaningful across hub replicas: a client failing
+		// over to another hub must not get a spurious 304 from a colliding
+		// counter, and identical content legitimately answers 304.
+		etag string
 	}
-}
-
-type subscriber struct {
-	id int64
-	ch chan *pb.DiscoveryResponse
 }
 
 // NewHub creates a Hub. onReady is called once after the first successful
@@ -97,7 +96,6 @@ func NewHub(lg *zap.Logger, etcdCli *clientv3.Client, onReady func()) *Hub {
 		bootstrapRetryIntvl: defBootstrapRetryIntvl,
 		promRefreshIntvl:    defPromRefreshIntvl,
 	}
-	h.mu.subs = make(map[int64]*subscriber)
 	return h
 }
 
@@ -125,6 +123,31 @@ func (h *Hub) Close() error {
 // ParseCount returns how many times the snapshot was re-derived. Only for tests.
 func (h *Hub) ParseCount() int64 {
 	return h.parseCnt.Load()
+}
+
+// HandleTopology serves GET /api/topology. A matching If-None-Match answers
+// 304 with no body; otherwise the cached serialized response is written with
+// the current ETag.
+func (h *Hub) HandleTopology(c *gin.Context) {
+	h.mu.RLock()
+	respJSON, etag := h.mu.respJSON, h.mu.etag
+	h.mu.RUnlock()
+	if respJSON == nil {
+		// Not bootstrapped. The readiness gate normally keeps requests away;
+		// this is a defensive answer for direct probes.
+		metrics.DiscoveryRequestCounter.WithLabelValues("503").Inc()
+		c.JSON(http.StatusServiceUnavailable, "the topology is not bootstrapped yet")
+		return
+	}
+	if c.GetHeader("If-None-Match") == etag {
+		metrics.DiscoveryRequestCounter.WithLabelValues("304").Inc()
+		c.Header("ETag", etag)
+		c.Status(http.StatusNotModified)
+		return
+	}
+	metrics.DiscoveryRequestCounter.WithLabelValues("200").Inc()
+	c.Header("ETag", etag)
+	c.Data(http.StatusOK, "application/json", respJSON)
 }
 
 // watchLoop is the only goroutine that talks to PD for the topology. It
@@ -207,8 +230,7 @@ func (h *Hub) bootstrap(ctx context.Context) (int64, error) {
 	h.mu.raw = raw
 	h.mu.snap = snap
 	h.mu.rev = baseRev
-	h.rebuildFullRespLocked()
-	h.broadcastLocked(h.mu.fullResp, metrics.BroadcastTypeFull)
+	h.rebuildRespLocked()
 	h.mu.Unlock()
 
 	h.lg.Info("topology bootstrapped", zap.Int64("revision", baseRev), zap.Int("backends", len(snap)))
@@ -270,27 +292,21 @@ func (h *Hub) applyEvents(events []*clientv3.Event, rev int64) {
 	h.mu.raw = raw
 	h.mu.snap = snap
 	h.mu.rev = max(h.mu.rev, rev)
-	h.rebuildFullRespLocked()
 	if len(upserted) > 0 || len(removed) > 0 {
-		delta := &pb.DiscoveryResponse{
-			Revision:     h.mu.rev,
-			Upserted:     upserted,
-			RemovedAddrs: removed,
-		}
-		h.broadcastLocked(delta, metrics.BroadcastTypeDelta)
-		h.lg.Info("topology changed", zap.Int("upserted", len(upserted)),
+		h.rebuildRespLocked()
+		h.lg.Info("topology changed", zap.Strings("upserted", upserted),
 			zap.Strings("removed", removed), zap.Int64("revision", h.mu.rev))
 	}
 	h.mu.Unlock()
 }
 
-// diffSnap compares two snapshots and returns the difference.
-// The results are sorted by address for determinism.
-func diffSnap(oldSnap, newSnap map[string]*infosync.TiDBTopologyInfo) (upserted []*pb.TiDBInstance, removed []string) {
+// diffSnap compares two snapshots and returns the changed addresses, sorted,
+// for logging and change detection.
+func diffSnap(oldSnap, newSnap map[string]*infosync.TiDBTopologyInfo) (upserted, removed []string) {
 	for _, addr := range slices.Sorted(maps.Keys(newSnap)) {
 		oldInfo, ok := oldSnap[addr]
 		if !ok || !instanceEqual(oldInfo, newSnap[addr]) {
-			upserted = append(upserted, ToTiDBInstance(newSnap[addr]))
+			upserted = append(upserted, addr)
 		}
 	}
 	for _, addr := range slices.Sorted(maps.Keys(oldSnap)) {
@@ -310,105 +326,37 @@ func instanceEqual(a, b *infosync.TiDBTopologyInfo) bool {
 		maps.Equal(a.Labels, b.Labels)
 }
 
-// rebuildFullRespLocked rebuilds the cached full response. It must be called
-// with the lock held whenever snap or prom changes. Caching one response per
-// snapshot version keeps (re)subscribing O(1): the response is shared by all
-// subscribers, which is safe because the snapshot is copy-on-write and proto
-// messages are safe for concurrent reads.
-func (h *Hub) rebuildFullRespLocked() {
-	upserted := make([]*pb.TiDBInstance, 0, len(h.mu.snap))
+// rebuildRespLocked reserializes the response and bumps the version (the
+// ETag). It must be called with the lock held whenever the content changes.
+// Serializing once per change keeps every request O(1): the bytes are shared
+// by all requests, which is safe because they are never mutated.
+func (h *Hub) rebuildRespLocked() {
+	backends := make([]TiDBInstance, 0, len(h.mu.snap))
 	for _, addr := range slices.Sorted(maps.Keys(h.mu.snap)) {
-		upserted = append(upserted, ToTiDBInstance(h.mu.snap[addr]))
+		backends = append(backends, ToTiDBInstance(h.mu.snap[addr]))
 	}
-	h.mu.fullResp = &pb.DiscoveryResponse{
+	resp := TopologyResponse{
 		Revision:   h.mu.rev,
-		Full:       true,
-		Upserted:   upserted,
-		Prometheus: ToPbPromInfo(h.mu.prom),
+		Backends:   backends,
+		Prometheus: ToWirePromInfo(h.mu.prom),
 	}
+	respJSON, err := json.Marshal(&resp)
+	if err != nil {
+		// Marshalling plain structs cannot fail; keep the old response if it
+		// somehow does.
+		h.lg.Error("marshal topology response failed", zap.Error(err))
+		return
+	}
+	hash := fnv.New64a()
+	_, _ = hash.Write(respJSON)
+	h.mu.respJSON = respJSON
+	h.mu.etag = strconv.FormatUint(hash.Sum64(), 16)
 	metrics.DiscoveryRevisionGauge.Set(float64(h.mu.rev))
 	metrics.DiscoveryBackendsGauge.Set(float64(len(h.mu.snap)))
 }
 
-// broadcastLocked sends the response to all subscribers without blocking the
-// watch loop: a subscriber whose buffer is full is dropped and will
-// re-subscribe with a fresh full snapshot.
-func (h *Hub) broadcastLocked(resp *pb.DiscoveryResponse, tp string) {
-	for id, sub := range h.mu.subs {
-		select {
-		case sub.ch <- resp:
-		default:
-			close(sub.ch)
-			delete(h.mu.subs, id)
-			metrics.DiscoverySubDroppedCounter.Inc()
-			h.lg.Warn("dropped a slow subscriber", zap.Int64("id", id))
-		}
-	}
-	metrics.DiscoverySubscribersGauge.Set(float64(len(h.mu.subs)))
-	metrics.DiscoveryBroadcastCounter.WithLabelValues(tp).Inc()
-}
-
-// register adds a subscriber and returns the current full snapshot in one
-// critical section, so that any delta broadcast after registration is
-// guaranteed to be newer than the returned snapshot.
-func (h *Hub) register() (*subscriber, *pb.DiscoveryResponse) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.mu.fullResp == nil {
-		return nil, nil
-	}
-	h.mu.nextID++
-	sub := &subscriber{
-		id: h.mu.nextID,
-		ch: make(chan *pb.DiscoveryResponse, subChanCap),
-	}
-	h.mu.subs[sub.id] = sub
-	metrics.DiscoverySubscribersGauge.Set(float64(len(h.mu.subs)))
-	return sub, h.mu.fullResp
-}
-
-// deregister is idempotent: the subscriber may have already been removed by
-// broadcastLocked. It never closes the channel because closing is owned by
-// the slow-consumer path in broadcastLocked.
-func (h *Hub) deregister(sub *subscriber) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	delete(h.mu.subs, sub.id)
-	metrics.DiscoverySubscribersGauge.Set(float64(len(h.mu.subs)))
-}
-
-// Subscribe implements the TiDBDiscovery service. It always sends a full
-// snapshot first and then deltas. Keyspaces and KnownRevision in the request
-// are accepted but ignored for now: every (re)connect gets a full snapshot.
-func (h *Hub) Subscribe(req *pb.SubscribeRequest, stream pb.TiDBDiscovery_SubscribeServer) error {
-	sub, fullResp := h.register()
-	if sub == nil {
-		return status.Error(codes.Unavailable, "the topology is not bootstrapped yet")
-	}
-	defer h.deregister(sub)
-	h.lg.Info("subscriber connected", zap.Int64("id", sub.id), zap.String("client_id", req.ClientId))
-
-	if err := stream.Send(fullResp); err != nil {
-		return err
-	}
-	for {
-		select {
-		case resp, ok := <-sub.ch:
-			if !ok {
-				return status.Error(codes.ResourceExhausted, "dropped: consuming too slowly")
-			}
-			if err := stream.Send(resp); err != nil {
-				return err
-			}
-		case <-stream.Context().Done():
-			h.lg.Info("subscriber disconnected", zap.Int64("id", sub.id), zap.String("client_id", req.ClientId))
-			return nil
-		}
-	}
-}
-
-// promLoop periodically refreshes the Prometheus info and piggybacks it to
-// subscribers when it changes.
+// promLoop periodically refreshes the Prometheus info; a change bumps the
+// version so that pollers pick it up.
 func (h *Hub) promLoop(ctx context.Context) {
 	ticker := time.NewTicker(h.promRefreshIntvl)
 	defer ticker.Stop()
@@ -446,13 +394,9 @@ func (h *Hub) refreshProm(ctx context.Context) {
 		return
 	}
 	h.mu.prom = &prom
-	if h.mu.fullResp == nil {
-		// Not bootstrapped yet: the first full response will carry it.
+	if h.mu.respJSON == nil {
+		// Not bootstrapped yet: the first bootstrap will carry it.
 		return
 	}
-	h.rebuildFullRespLocked()
-	h.broadcastLocked(&pb.DiscoveryResponse{
-		Revision:   h.mu.rev,
-		Prometheus: ToPbPromInfo(&prom),
-	}, metrics.BroadcastTypeDelta)
+	h.rebuildRespLocked()
 }
