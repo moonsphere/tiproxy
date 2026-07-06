@@ -3,6 +3,22 @@
 设计见 [discovery-hub.md](discovery-hub.md)。本文档是施工图：按 PR 拆分，每个 PR
 可独立合入、独立回滚。实现时按顺序走，每个 PR 内按小节顺序写代码。
 
+> **施工完成记录（2026-07-06）**：PR1-PR10 全部合入 `feat/discovery-hub`。
+> PR1-5 按下文计划执行；实际增补：
+>
+> | PR | 内容 |
+> |---|---|
+> | PR6 | 全功能 review 修复（discovery 模式拒绝 hub-source 集群、Close 错误不再被吞、空地址守卫、source 归一化） |
+> | PR7 | 打包：镜像内置 `conf/hub.toml` 模板；实测 `make docker` + 容器连真 PD |
+> | PR8 | E2E P0 六场景（compose 真集群,SQL 指纹裁决） |
+> | PR9 | E2E P1（S7 hub 重启 full 替换、S8 pd↔hub 热迁移） |
+> | **PR10** | **传输层替换**：gRPC 流 → HTTP 轮询 + ETag（内容 hash）。**下文 PR2
+> （proto）与 PR3/PR4 中的 gRPC/订阅者部分已退役**,保留作施工历史;现行实现见设计
+> 文档 §5/§6/§8 与 `pkg/discovery/{hub,client,types}.go` |
+>
+> E2E 环境注记：宿主机磁盘 >90% 会触发 TiKV low-space 保护导致 TiDB bootstrap
+> FATAL —— compose 已给 TiKV 声明 `--capacity=10GB` 规避。
+
 约定（全仓库通用）：
 - 错误处理用 `lib/util/errors`（`errors.WithStack` / `errors.Wrapf`），重试用
   `lib/util/retry`，goroutine 用 `pkg/util/waitgroup`。

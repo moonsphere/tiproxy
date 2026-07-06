@@ -4,7 +4,7 @@
 
 | 层 | 已有 | 空缺 |
 |---|---|---|
-| 单元/集成（embedded etcd + 进程内 gRPC） | hub/client/backendcluster/server 87 项 | — |
+| 单元/集成（embedded etcd + 进程内 HTTP） | hub/client/backendcluster/server 40+ 项 | — |
 | 容器烟囱（手工） | 镜像内 discovery 模式连真 PD | 未自动化 |
 | **端到端** | — | **真 PD/TiDB/SQL 链路、生命周期事件、hub HA、灰度** |
 

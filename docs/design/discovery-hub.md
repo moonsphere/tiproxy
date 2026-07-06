@@ -191,49 +191,48 @@ func NewDiscoveryServer(ctx context.Context, sctx *sctx.Context) (*Server, error
 ## 5. Hub 内部 —— `pkg/discovery/hub.go`
 
 > 包布局：hub 与 HubClient 同属发现基础设施，统一放 `pkg/discovery/`
->（`hub.go` + `client.go`），不拆到 `pkg/balance/` 和 `pkg/manager/` 两处。
+>（`hub.go` + `client.go` + `types.go`）。
 
 ```go
 type Hub struct {
     etcdCli *clientv3.Client
     lg      *zap.Logger
     mu      sync.RWMutex
-    raw     map[string][]byte                    // 所有 /topology/{tidb,keyspaces} 的 kv（info+ttl）
+    raw     map[string][]byte                     // 所有 /topology/{tidb,keyspaces} 的 kv（info+ttl）
     snap    map[string]*infosync.TiDBTopologyInfo // 派生出的存活快照（info+ttl 配对后）
     prom    *infosync.PrometheusInfo
-    rev     int64
-    subs    map[int64]*subscriber
-    nextID  int64
-}
-type subscriber struct {
-    keyspaces map[string]struct{}                // 空 = 全部
-    ch        chan *pb.DiscoveryResponse         // 带缓冲；慢消费者 → 关闭并丢弃
+    rev     int64                                  // etcd revision（观测用）
+    respJSON []byte                                // 序列化好的 TopologyResponse，全部请求共享
+    etag     string                                // respJSON 的 fnv64a hash
 }
 ```
+
+hub **无状态**：没有订阅者表，请求处理是纯读（`HandleTopology`：If-None-Match
+命中回 304，否则回缓存的 respJSON + ETag）。内容变化时 `rebuildRespLocked` 重新
+序列化一次并重算 hash —— 每请求 O(1)。
 
 ### watchLoop（唯一碰 PD 的 goroutine）
 
 ```go
 func (h *Hub) watchLoop(ctx context.Context) {
   for ctx.Err() == nil {
-    // 1. bootstrap 全量 —— 两个 range 用一个 Txn 读到同一 revision（见 F3）
+    // 1. bootstrap 全量 —— 两个 range 用一个 Txn 读到同一 revision（F3）
     resp,_ := h.etcdCli.Txn(ctx).Then(
         clientv3.OpGet("/topology/tidb/",  clientv3.WithPrefix()),
         clientv3.OpGet("/keyspaces/tidb/", clientv3.WithPrefix()),
     ).Commit()
-    baseRev := resp.Header.Revision                    // 单一、一致的 revision
-    h.applyFull(resp.Responses, baseRev)               // raw=…、snap=ParseTiDBTopology(raw)、rev=baseRev
-    h.broadcastFull()
+    baseRev := resp.Header.Revision
+    h.applyFull(resp.Responses, baseRev)   // raw、snap=ParseTiDBTopology(raw)、rebuildResp
 
     // 2. 增量 —— 两个 watch 都 pin 到同一 baseRev+1
-    wch := h.etcdCli.Watch(ctx, "/topology/tidb/",  clientv3.WithPrefix(), clientv3.WithRev(baseRev+1))
-    wch2:= h.etcdCli.Watch(ctx, "/keyspaces/tidb/", clientv3.WithPrefix(), clientv3.WithRev(baseRev+1))
+    wch1 := h.etcdCli.Watch(ctx, "/topology/tidb/",  clientv3.WithPrefix(), clientv3.WithRev(baseRev+1))
+    wch2 := h.etcdCli.Watch(ctx, "/keyspaces/tidb/", clientv3.WithPrefix(), clientv3.WithRev(baseRev+1))
     for {
       select {
-      case wr, ok := <-wch:  if !ok || wr.Canceled { goto rebootstrap } // F15：关闭/取消都要重建
-                             h.applyEvents(wr.Events, wr.Header.Revision)
-      case wr, ok := <-wch2: if !ok || wr.Canceled { goto rebootstrap }
-                             h.applyEvents(wr.Events, wr.Header.Revision)
+      case wr, ok := <-wch1:  if !ok || wr.Canceled { goto rebootstrap } // F15
+                              h.applyEvents(wr.Events, wr.Header.Revision)
+      case wr, ok := <-wch2:  if !ok || wr.Canceled { goto rebootstrap }
+                              h.applyEvents(wr.Events, wr.Header.Revision)
       case <-ctx.Done(): return
       }
     }
@@ -242,114 +241,41 @@ func (h *Hub) watchLoop(ctx context.Context) {
 }
 ```
 
-> **F15 —— 必须处理 watch channel 关闭，只查 `Canceled` 会热循环。** clientv3 的
-> watch channel 在客户端关闭/ctx 结束等情况下会**直接 close**；从已关闭 channel
-> 读到的是零值 `WatchResponse`（`Canceled=false`、无事件）—— 只判 `Canceled` 的
-> select 会以零值空转成 CPU 热循环。必须 `wr, ok := <-wch; if !ok { rebootstrap }`。
-> 仓库先例：`election.watchOwner`（`election.go:271`）就是这么处理的。
+> **F3 —— bootstrap 的 revision 必须一致。** 两次独立 `Get` 返回在不同 revision，
+> 从其中一个起 watch 会漏/重事件。单个 `Txn` 读两个 prefix 共享
+> `resp.Header.Revision`，watch 从 `baseRev+1` 起。
+>
+> **F15 —— 必须处理 watch channel 关闭。** 关闭的 channel 读到零值
+> （`Canceled=false`），只判 `Canceled` 会热循环。`wr, ok := <-wch; !ok →
+> rebootstrap`。仓库先例：`election.watchOwner`。
+>
+> **F14 —— `rev = max(rev, header.Revision)`**：两个 watch channel 交错，直接赋值
+> 可能回退。
 
-> 两个 watch channel 的事件交错到达，revision 可能非单调（ch1 送来 rev105 后 ch2
-> 送来 rev103）。两个 prefix 的 key 不相交，应用顺序无所谓；但
-> `h.rev = max(h.rev, header.Revision)`，别直接赋值，避免 rev 回退。
+### 存活判定 —— 复用现有解析，别重写
 
-> **F3 —— bootstrap 的 revision 必须一致。** 两次独立 `Get` 返回在两个不同的
-> revision 上，从其中一个起 watch 会静默漏掉或重放间隙里的事件。用一个 `Txn` 把两
-> 个 prefix 读进来共享 `resp.Header.Revision`，再从 `baseRev+1` 起 watch。（现有
-> `GetTiDBTopology` 是两次独立 Get —— 对自愈轮询无害，建 watch 基线不行。）
-
-### 存活判定的坑 —— 复用现有解析，别重写
-
-`InfoSyncer.GetTiDBTopology`（`info.go:257`）把 `…/info` 与 `…/ttl` 配对，`ttl`
-缺失的 backend（宕机）被丢弃。增量路径上一个 tidb 宕机表现为它的 `ttl` key 的
-**DELETE 事件**（lease 过期，`info` 可能一起被删）。与其在事件路径重写这套逻辑，不
-如保留 **raw** kv map，每批事件后用**同一个解析器**重新派生存活快照：
+`ttl` 缺失即宕机的配对逻辑在 `infosync.ParseTiDBTopology`（PR1 抽出的共享
+helper）。增量路径保留 **raw** kv map，每批事件后用同一解析器重derive快照：
 
 ```
-applyEvents:  用事件更新 h.raw（PUT 置入 / DELETE 移除）
-              newSnap := infosync.ParseTiDBTopology(h.raw)   // 从 GetTiDBTopology 抽出的共享 helper
-              delta   := diff(h.snap, newSnap)               // upserted + removed addrs
-              h.snap = newSnap; h.rev = header.Revision       // 新 map + 新指针（F8）
-              if delta 非空 { h.broadcastDelta(delta, h.rev) }   // 抑制无变化抖动（F5）
+applyEvents:  F16 短路: 一批事件全是"已存在 key 的 PUT 且(是 ttl key 或值相同)"
+              → 只更新 raw,跳过全部（ttl 值是时间戳每 30s 变,稳态 100% 走这条）
+              否则: raw2 := clone+apply; newSnap := ParseTiDBTopology(raw2)
+              diff 非空才 rebuildRespLocked（F5: 内容不变则 ETag 不变,轮询端持续 304）
 ```
 
-> **F5 —— 在派生快照上做 diff，绝不转发 raw 事件。** 每个 TiDB 周期性重 `Put`
-> `info` 与 `ttl`（tiproxy 对称写入器每 30s 两个都写，`syncTopology`，
-> `info.go:210`）。拓扑不变时 watch 也持续吐 PUT。若转发 raw 事件，会每 ~30s 给全
-> 部 N 个 sidecar 推一次无变化更新。派生存活快照、只广播非空 `diff` 把抖动收敛到
-> 零。这是正确性，不是优化。
+> **F5/F16 —— 稳态零成本。** TiDB 每 ~30s 重 Put info+ttl；短路 + 内容比对让稳态
+> 下既不重解析、也不换 ETag —— 轮询端一直 304。
 >
-> **F16 —— 纯 ttl 刷新要短路，别每批事件全量重解析。** `ttl` 的值是
-> `time.Now().UnixNano()`（`info.go:240`）—— **每次刷新都变**，watch 稳定期持续吐
-> PUT。而存活判定只看 ttl key 的**存在性**，不看值。若每批事件都
-> `ParseTiDBTopology(全量 raw)`，T 个 tidb = 每 30s 内 T 次全量 JSON 反序列化循环，
-> T=1000 时纯浪费的 CPU。短路规则：一批事件若全是"已存在 key 的 PUT 且（是 ttl
-> key 或 value 与 raw 中相同）"→ 只更新 raw，跳过重解析（快照不可能变）。出现
-> DELETE / 新 key PUT / info 值变化才走全量重解析 + diff。稳态开销归零，重解析只在
-> 拓扑真变时发生（罕见），解析器仍是同一个。
+> **F8 —— 快照 copy-on-write。** 新 map + 新指针，绝不原地改；respJSON 字节只读
+> 共享。
 >
-> **F8 —— 快照是 copy-on-write。** `applyEvents` 构造**新** map + **新**
-> `*TiDBTopologyInfo` 指针，绝不原地改旧值。`GetTiDBTopology` 交出去的是
-> `maps.Clone(snap)`（浅拷 —— 共享指针）；COW 让共享指针可并发安全读。
-> `HubClient.apply` 同样纪律。
+> **ETag = 内容 hash（fnv64a），不是本地计数器。** client 在 hub 副本间 failover
+> 时计数器会碰撞产生假 304（实现期单测抓到的 bug）；内容 hash 跨副本语义天然正
+> 确，副本间内容一致回 304 反而是合法优化。
 
-### Subscribe（gRPC handler）
-
-```go
-func (h *Hub) Subscribe(req *pb.SubscribeRequest, stream pb.TiDBDiscovery_SubscribeServer) error {
-    // register 与 full 快照的捕获必须在同一次持锁内完成（F12）
-    sub, fullResp := h.register(req.Keyspaces)
-    defer h.deregister(sub)
-    // 每次（重）连都发当前快照 full=true（F4）。req.KnownRevision 接受但暂时忽略。
-    if err := stream.Send(fullResp); err != nil { return err }
-    for {
-        select {
-        case resp, ok := <-sub.ch:                       // 溢出时被 broadcast 关闭（F9）
-            if !ok { return status.Error(codes.ResourceExhausted, "slow consumer") }
-            if err := stream.Send(resp); err != nil { return err }
-        case <-stream.Context().Done(): return nil
-        }
-    }
-}
-
-// broadcast 绝不阻塞 watchLoop：非阻塞发送，丢弃慢订阅者（F9）
-func (h *Hub) broadcast(resp *pb.DiscoveryResponse) {
-    for id, sub := range h.subs {
-        select {
-        case sub.ch <- resp:
-        default:                                          // 缓冲满 → 强制重连
-            close(sub.ch); delete(h.subs, id)             // sidecar 重新 Subscribe → 拿全量
-        }
-    }
-}
-```
-
-> **F4 —— 重连不做 delta 重放。** hub 不保留 per-client 历史，无法从任意
-> `known_revision` 重建 delta。每次（重）连都拿 **full** 快照（几 KB～几十 KB，
-> 就算 1000 个 sidecar 一起重连也便宜）。`known_revision` 字段保留在 proto 里，留
-> 给未来带界限的事件日志优化，初版忽略。这也消掉了跨 hub 副本的 revision 一致性负
-> 担。
->
-> **F9 —— broadcast 不能阻塞 `watchLoop`。** 向每个订阅者的带缓冲 channel 非阻塞
-> 发送；溢出就关闭并丢弃。被丢的 sidecar 的流报错、重连、拿到新的全量快照。
->
-> **F12 —— full 快照必须与注册原子捕获。** 若 `register`（入 `h.subs`）和
-> `fullResponse`（读 `h.snap`）分两次拿锁，中间广播进 `sub.ch` 的 delta 会**旧于**
-> 后拿到的 full —— handler 先发 full 再回放旧 delta，客户端把过期变更盖到新快照上。
-> `register` 在同一次持锁内完成"入订阅表 + 生成 full 响应"，之后进入 `sub.ch` 的一
-> 定严格新于 full，顺序天然正确。
->
-> **F17 —— full 响应按快照版本缓存一份，重连风暴时 O(1)。** v1 无 keyspace 过滤，
-> full 响应对所有订阅者相同 —— 快照更新时构建一次 `*pb.DiscoveryResponse` 存在
-> `Hub` 上，`register` 直接复用指针（proto 消息并发只读/序列化是安全的，配合 F8 的
-> COW 不会被改）。否则 hub 重启后 1000 个 sidecar 同时重连，每个 register 都持锁做
-> O(T) 转换 = 10 万次转换 + 锁竞争尖峰。
->
-> **keyspace 过滤 v1 不实现。** `broadcast` 对所有订阅者发同一条响应，不做 per-sub
-> 过滤；`SubscribeRequest.keyspaces` 字段保留在 proto，hub 先忽略（发全量），需要时
-> 再加过滤，客户端无需变更。
-
-Prometheus 信息：一个小 `promLoop`（复用 `GetPromInfo` 或 watch
-`/topology/prometheus`）更新 `h.prom`，捎带在下一条响应里。
+> 历史注记：gRPC 推送版的 F4（重连全量）/F9（慢消费者）/F12（注册原子性）/
+> F17（full 响应缓存）随传输层退役 —— 轮询模型里这些问题不存在。
 
 ## 6. 传输协议 —— HTTP + JSON（`GET /api/topology`）
 
@@ -381,102 +307,51 @@ GET /api/topology
 
 ## 7. 路由注册 —— `pkg/server/api`
 
-API server 已把 gRPC+HTTP 复用在一个 listener 上并注册了 `diagnosticspb`
-（`server.go:188`）。加一个用于精简 discovery profile 的兄弟构造函数：
+复用 api server 的 listener/中间件装配（`newBaseServer` + `start`），精简
+discovery profile 的兄弟构造函数：
 
 ```go
-func NewDiscoveryServer(cfg config.API, lg *zap.Logger, hub *discovery.Hub, ready *atomic.Bool) (*Server, error) {
-    // 与 NewServer 相同的 listener + h2c mux，但只注册：
-    tidb_discoverypb.RegisterTiDBDiscoveryServer(h.grpc, hub)
-    grpc_health_v1.RegisterHealthServer(h.grpc, healthSrv)   // 供 k8s readiness
-    diagnosticspb.RegisterDiagnosticsServer(h.grpc, ...)
-    // gin：只留 /metrics、/debug/pprof
+func NewDiscoveryServer(cfg config.API, lg, cfgMgr, certMgr, hub api.TopologyHandler, ready) (*Server, error) {
+    // 与 NewServer 相同的 listener + 中间件，但只注册：
+    engine.Group("api").GET("/topology", hub.HandleTopology)
+    // + 原有 diagnostics gRPC、/metrics、/debug
 }
 ```
 
-Hub 在 `cfg.API.Addr` 上服务 —— 不开新端口。
+Hub 在 `cfg.API.Addr` 上服务 —— 不开新端口。readiness 探针直接用
+`GET /api/topology`（bootstrap 前 503/挡在 readyState，之后 200）或
+`/debug/health`。
 
 ## 8. Sidecar 侧（代理模式）—— `pkg/discovery/client.go`
 
-`HubClient` 是 `infoSyncer` 的直接替换：实现消费方用到的那两个方法 + `Close`。
+`HubClient` 是 `infoSyncer` 的直接替换：实现 `GetTiDBTopology`/`GetPromInfo`/
+`Close`，下游（Cluster/observer/router）零改动。
 
 ```go
 type HubClient struct {
-    hubAddrs []string
-    tls      *tls.Config
-    lg       *zap.Logger
-    mu       sync.RWMutex
-    snap     map[string]*infosync.TiDBTopologyInfo
-    prom     *infosync.PrometheusInfo
-    rev      int64
-    readyCh  chan struct{}
+    hubAddrs []string          // 逗号列表
+    tlsGetter func() *tls.Config
+    pollIntvl time.Duration    // 默认 3s
+    httpCli  *http.Client      // DisableKeepAlives: 每次新建连接,规避 hub 重部署后的 DNS 滞后
+    mu struct { snap map[...]; prom *...; rev int64; etag string }
 }
 
-func (c *HubClient) Start(ctx) { go c.streamLoop(ctx) }
-
-func (c *HubClient) streamLoop(ctx) { // dial→Subscribe→apply→重连(backoff, 下一个 addr)
-  for ctx.Err()==nil {
-    conn,_ := grpc.DialContext(ctx, pick(c.hubAddrs), creds)
-    stream,_ := pb.NewTiDBDiscoveryClient(conn).Subscribe(ctx, &pb.SubscribeRequest{KnownRevision: c.rev})
-    for {
-      resp, err := stream.Recv(); if err != nil { break } // → backoff、重连
-      c.apply(resp)   // full → 替换；delta → upsert/remove；置 rev；首次关闭 readyCh
-    }
-  }
-}
-
-// infoSyncer 的直接替换：
-func (c *HubClient) GetTiDBTopology(ctx) (map[string]*infosync.TiDBTopologyInfo, error) {
-    c.mu.RLock(); defer c.mu.RUnlock()
-    if c.snap == nil { return nil, errHubNotReady }  // PDFetcher 无限重试 —— 与 PD 未就绪同理
-    return maps.Clone(c.snap), nil
-}
-func (c *HubClient) GetPromInfo(ctx) (*infosync.PrometheusInfo, error) { ... }
-func (c *HubClient) Close() error { ... }
+// pollLoop: 每 3s GET http(s)://<sticky addr>/api/topology,带 If-None-Match
+//   304 → 无事;200 → 解码 → COW 全量替换缓存 + 存新 ETag
+//   失败 → 轮换下一个地址(sticky-on-success),错误日志限频
 ```
 
-3s observer 循环现在读这个本地缓存 —— 便宜；拓扑新鲜度来自 push 流。
+- 首个快照到达前 `GetTiDBTopology` 返回 `ErrHubNotReady` —— PDFetcher 对错误无限
+  重试,语义与"PD 未就绪"一致。
+- fleet 的轮询时钟因启动时间不同天然错开,hub 重启无惊群(304 本身近零成本)。
+- 3s observer/健康检查循环读本地缓存,轮询间隔与之同量级 —— 端到端感知延迟不变。
 
 ### 装配分支 —— `backendcluster.NewCluster`
 
-分支点在 `NewCluster`（`cluster.go:74`），server.go 不动：
-
-```go
-// Cluster 内部：infoSyncer *infosync.InfoSyncer 字段改为 topo topoSource
-func NewCluster(ctx, cfg, clusterCfg, clusterTLS, logger, cfgGetter, metricsQuerier) (*Cluster, error) {
-    ...
-    var topo topoSource
-    var etcdCli *clientv3.Client
-    switch clusterCfg.DiscoverySource {
-    case "hub":
-        // F10：不建 etcd 客户端。etcdCli 留 nil。
-        hub := discovery.NewHubClient(clusterCfg.HubAddrs, clusterTLS, logger.Named("hubcli"))
-        hub.Start(ctx)
-        topo = hub
-    default: // "" / "pd"，现状路径原样
-        etcdCli, err = etcd.InitEtcdClientWithAddrsAndDialer(..., clusterCfg.PDAddrs, ...)
-        is := infosync.NewInfoSyncer(...); is.Init(ctx, cfg)
-        topo = is
-    }
-    cluster := &Cluster{cfg: clusterCfg, etcdCli: etcdCli, topo: topo, ...}
-    // ClusterReader 照旧创建；etcdCli 为 nil 时其内部选举 no-op（election.go 有
-    // nil-guard），见 §11 限制
-    ...
-}
-```
-
-- `Cluster.GetTiDBTopology`/`GetPromInfo` 改调 `c.topo`；`Close` 里 `c.etcdCli`
-  加 nil 判。
-- **静态后端不需要 source**：不配 `backend-clusters`/`pd-addrs` 时
-  `GetBackendClusters()` 返回空、Manager 无集群，`FallbackFetcher`（nsMgr
-  `manager.go:59-61`）自动退到 namespace 的静态 instance 列表 —— 旧设计里的
-  `discovery-source=static` 档位**删除**，上游已原生覆盖。
-
-> **F10（修订）—— hub 集群条目必须显式绕过 etcd，不能靠判空 addr。** 旧版结论不
-> 变、位置变了：legacy 单集群路径 `GetBackendClusters()` 用 `Proxy.PDAddrs` 合成
-> 默认集群（`proxy.go:284`），而 `NewConfig()` 给它填默认值 `"127.0.0.1:2379"` ——
-> 不显式按 `DiscoverySource` 分支的话，hub 模式会拿默认地址去连不存在的本地 PD。
-> `NewCluster` 的 switch 按 source 分支、hub 分支无条件不建 etcd 客户端。
+（与 gRPC 版一致,见原文）按 `clusterCfg.DiscoverySource` 分支:`"hub"` →
+`NewHubClient` 且**不建 etcd 客户端**（F10:`PDAddrs` 有默认值,必须显式按 source
+分支）;默认走现状 `InfoSyncer` 路径。`Cluster.Close` 对 etcdCli 判 nil。
+`clusterReusable` 纳入 `DiscoverySource`/`HubAddrs`,热改触发集群重建。
 
 ## 9. 配置 —— `lib/config/proxy.go` `BackendCluster`
 
@@ -516,12 +391,11 @@ hub-addrs = "tidb-discovery-c1.svc:3080"
 
 ## 10. 失败 / HA
 
-- K≥2 个 hub 副本在一个 Service 后；sidecar 故障时重连另一个 hub。
+- K≥2 个 hub 副本在一个 Service 后；sidecar 轮询失败时轮换到下一个地址。
 - 所有 hub 挂 → sidecar 用最后已知缓存服务（路由照常，只是发现不了新 tidb、也清不
   掉已死条目 —— 死后端由 sidecar 本地健康检查兜住，不至于把流量打到宕机 tidb）。破
   窗手段见 §9：切回 `discovery-source=pd` 滚动重启。
-- 每次（重）连 → hub 发 `full=true`；sidecar 替换缓存（F4）。无 delta 续传，没有跨
-  hub 的 revision 偏移要推敲。
+- 轮询天然全量:每次 200 都是完整快照,无续传语义,没有跨 hub 的状态要推敲。
 - Hub 地址由 k8s Service DNS / 静态配置下发 —— **不**经 PD 服务注册表 —— sidecar
   100% 不碰 PD。
 - **鉴权**：sidecar→hub 的 gRPC 复用 cluster mTLS（`certManager.ClusterTLS`），与
