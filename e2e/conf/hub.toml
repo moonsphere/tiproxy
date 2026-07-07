@@ -1,9 +1,0 @@
-# E2E: the discovery hub watches the compose PD.
-[proxy]
-pd-addrs = "pd:2379"
-
-[api]
-addr = "0.0.0.0:3080"
-
-[log]
-level = "info"

@@ -1,6 +1,6 @@
 # Discovery Hub 部署与运维手册
 
-设计见 [discovery-hub.md](discovery-hub.md)，实现拆分见
+设计见 [discovery-hub.md](discovery-hub.md)，实现导览见
 [discovery-hub-impl.md](discovery-hub-impl.md)。本文档面向部署与运维。
 
 ## 1. 何时需要 hub
@@ -58,7 +58,7 @@ hub-addrs = "tidb-discovery.default.svc:3080"
 
 | 项 | pd（默认） | hub |
 |---|---|---|
-| 拓扑感知 | 每 3s 轮询 PD | hub 推送（秒级），本地缓存 |
+| 拓扑感知 | 每 3s 轮询 PD | 每 3s 轮询 hub（稳态空 304），本地缓存 |
 | PD 连接 | 每实例一个 etcd client | **零** |
 | 自注册 `/topology/tiproxy` | 是 | 否（sidecar 不出现在 PD 拓扑里） |
 | 健康检查 | sidecar 本地打 TiDB status port | 同左（不变） |
@@ -70,13 +70,13 @@ hub-addrs = "tidb-discovery.default.svc:3080"
 按集群条目逐步切换，`discovery-source`/`hub-addrs` 可热改（配置 reload 时该集群
 会重建）：
 
-1. 部署 K 个 hub 副本，确认全部 ready（health SERVING，`tidb_discovery_backends`
-   与实际 TiDB 数一致）。
+1. 部署 K 个 hub 副本，确认全部 ready（`GET /api/topology` 非 503，
+   `tidb_discovery_backends` 与实际 TiDB 数一致）。
 2. 选 1 台 sidecar，把目标集群条目改为 `discovery-source = "hub"`，reload。
-3. 对比该实例与 pd 模式实例的后端列表（`/api/backend` 或日志），观察
-   `tidb_discovery_subscribers` +1。
-4. kill 一个 TiDB（或缩容），确认 canary 实例在 lease TTL（45s）+ 推送延迟内摘除
-   该后端。
+3. 对比该实例与 pd 模式实例的后端列表（`/api/backend` 或日志）；hub 侧
+   `requests_total{code="304"}` 速率随之上升（每实例约 1/3s）。
+4. kill 一个 TiDB（或缩容），确认 canary 实例在 lease TTL（45s）+ 轮询周期（3s）
+   内摘除该后端。
 5. 分批扩大；每批观察 hub 侧指标（见 §6）。
 6. 全量后确认 PD etcd 侧 watch/range 指标降到 O(K)。
 
@@ -145,10 +145,10 @@ TiDB）。
 
 ## 8. 容量参考
 
-- 单 hub fan-out：单元测试中 200 订阅者 × 全量+增量 <1s（`TestHubManySubscribers`）。
-  生产按 N/K 每副本数百订阅者规划，瓶颈在 gRPC 连接数而非 CPU（稳态零广播，见设计
-  F5/F16）。
-- 全量快照体积 ≈ TiDB 数 × ~200B；1000 sidecar 同时重连（hub 重启）由 full 响应
-  缓存（F17）+ 客户端 ±20% jitter 摊平。
-- hub 对 PD 的负载：每副本 1 次 bootstrap Txn + 2 条 watch 流 + 每 30s 一次
-  Prometheus 信息读取。
+- 请求负载：每副本 ≈ N/K × 1/3s 次 GET；稳态几乎全是**空 304**（响应体 0 字节，
+  服务端一次 header 比较），响应体走预序列化缓存，每请求 O(1)，无 per-client
+  状态。1000 sidecar / 3 副本 ≈ 每副本 111 req/s，纯 CPU 层面余量巨大。
+- 拓扑变化瞬间：下一轮询周期内全体拿一次 200 全量，体积 ≈ TiDB 数 × ~200B；
+  fleet 轮询时钟因启动时间不同天然错开，无惊群。
+- hub 对 PD 的负载（与 N 无关）：每副本 1 次 bootstrap Txn + 2 条 watch 流 +
+  每 30s 一次 Prometheus 信息读取。

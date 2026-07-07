@@ -1,119 +1,115 @@
-# Discovery Hub E2E 测试设计
+# TiDB 拓扑发现 —— E2E 测试
 
-设计见 [discovery-hub.md](discovery-hub.md)。现有测试的覆盖与空缺：
+设计见 [discovery-hub.md](discovery-hub.md)。测试分层:
 
-| 层 | 已有 | 空缺 |
+| 层 | 位置 | 盖什么 |
 |---|---|---|
-| 单元/集成（embedded etcd + 进程内 HTTP） | hub/client/backendcluster/server 40+ 项 | — |
-| 容器烟囱（手工） | 镜像内 discovery 模式连真 PD | 未自动化 |
-| **端到端** | — | **真 PD/TiDB/SQL 链路、生命周期事件、hub HA、灰度** |
+| 单元/集成 | tiproxy `pkg/discovery`、`pkg/manager/backendcluster`;pd `pkg/mcs/tidbdiscovery`(embedded etcd) | 协议语义、hub 拓扑维护、集群注入;golden JSON 契约互锁 |
+| **端到端(本文档)** | `e2e/`,docker-compose,8 场景 | 单测替身盖不住的:**真 TiDB 注册/注销**(lease、优雅退出清 key)、**真 SQL 流量经 sidecar 的路由结果**、**多进程真网络故障切换时序** |
 
-E2E 补的是单测替身盖不住的东西：**真 TiDB 的注册/注销行为**（lease、优雅退出
-时的 key 清理）、**真 SQL 流量经 sidecar 的路由结果**、**多进程真网络下的故障
-切换时序**。
+千级规模不在此层:S9/S10(规模烟囱、PD 负载对比)留作 P2,更大规模走 k8s 专项。
 
-## 1. 基建选型：docker-compose
+## 1. 拓扑
 
-| 候选 | 评价 |
-|---|---|
-| **docker-compose（选定）** | 可复现、无 host 依赖（只要 docker）、直接复用 `moonsphere/tiproxy:discovery-hub` 镜像、天然支持 kill/stop/scale 编排 |
-| tiup playground | 最快，但依赖 host 装 tiup，进程编排（kill 单个 tidb）别扭 |
-| kind (k8s) | 最贴近 sidecar mesh 终态，但重、慢，规模压测阶段再上 |
-
-TiDB 要向 PD 注册 `/topology/tidb/*` 必须真集群模式 → 最小拓扑 **PD×1 + TiKV×1 +
-TiDB×2**（两台 TiDB 才能断言路由分布与摘除）。
-
-### Compose 拓扑
+docker-compose(可复现、只依赖 docker、天然支持 kill/scale 编排)。TiDB 要向
+PD 注册 `/topology/tidb/*` 必须真集群模式,故最小拓扑 PD×1 + TiKV×1 + TiDB×2
+(两台才能断言路由分布与摘除)。
 
 ```
                        ┌────────────────────────────────────┐
-                       │            e2e 网络（bridge）        │
+                       │            e2e 网络(bridge)         │
   pd (pingcap/pd)      │  tikv (pingcap/tikv)               │
       ▲   ▲            │      tidb-0, tidb-1 (pingcap/tidb) │
       │   │ watch      │            ▲                       │
    hub-0  hub-1        │            │ SQL(4000)             │
       ▲   ▲            │       健康检查(10080)               │
-      └─┬─┘ Subscribe  │            │                       │
+      └─┬─┘ HTTP 轮询   │            │                       │
      sidecar ──────────┴────────────┘                       │
-      ▲ 6000/3080                                           │
+      ▲ 6000                                                │
       │                                                     │
-  Go test harness（host，docker CLI + mysql driver + HTTP）  │
+  Go test harness(host,docker CLI + mysql driver + HTTP)    │
 ```
 
-- hub-0/hub-1 用 PD 侧组件镜像(`TIDB_DISCOVERY_IMAGE`,由 pingkai/pd 静态编译
-  构建,见 e2e/Dockerfile.pd-discovery);sidecar 用 `TIPROXY_IMAGE`。
-- sidecar 配置：`discovery-source = "hub"`、`hub-addrs = "hub-0:3080,hub-1:3080"`、
-  **无 pd-addrs**（顺带持续验证零 PD 路径）。
-- 对照组（场景 S8 用）：`sidecar-pd`，`pd-addrs = "pd:2379"` 传统模式。
+- hub-0/hub-1 用 PD 侧组件镜像(`TIDB_DISCOVERY_IMAGE`,构建见 §4),入口
+  `pd-server services tidb-discovery --backend-endpoints=http://pd:2379`。
+- sidecar:`discovery-source = "hub"`、`hub-addrs = "hub-0:3080,hub-1:3080"`、
+  **无 pd-addrs**(顺带持续验证零 PD 依赖路径)。
+- 对照组(S8 用):`sidecar-pd`,`pd-addrs = "pd:2379"` 传统模式。
+- TiDB 容器 pin `hostname:`(指纹依据);TiKV 声明 `--capacity=10GB`
+  (宿主机磁盘 >90% 会触发 low-space 保护,TiDB bootstrap FATAL)。
 
 ## 2. 断言手段
 
 | 手段 | 用途 |
 |---|---|
-| **SQL 指纹**：host 用 go-sql-driver 连 sidecar:6000，`SELECT @@port`（tidb-0=4000 映射区分）循环 N 次收集集合 | 路由真相 —— 后端可达性/分布/摘除的最终裁决 |
-| **hub /metrics**：`tidb_discovery_{backends,revision,rebootstrap_total}` | hub 侧状态 |
-| **sidecar 日志 grep**：`docker logs`（reconnecting / not pushed snapshot） | 切换与降级路径确认 |
-| **PD etcd 直查**（etcdctl in pd 容器）：`/topology/tidb/` key 存在性 | 区分"TiDB 没注册"和"链路没传到" |
+| **SQL 指纹**:host 连 sidecar:6000,开一批连接各 `SELECT @@hostname`,收集主机名集合。连接**并发持有**再关 —— 路由按评分,顺序建连会全落同一后端 | 路由真相 —— 可达性/分布/摘除的最终裁决 |
+| **hub /metrics**:`tidb_discovery_{backends,revision,rebootstrap_total}` | hub 侧状态 |
+| **sidecar 日志 grep**:`rotating to the next hub` / `has not served a topology snapshot yet` / `updated backend cluster` | 切换、降级、reload 路径确认 |
+| **PD etcd 直查**(pd 容器内 etcdctl):`/topology/tidb/` key 存在性 | 区分"TiDB 没注册"与"链路没传到" |
 
-原则：**每个场景的最终断言必须落在 SQL 指纹上**（用户视角），metrics/日志只做中
-间态定位。
+原则:**每个场景的最终断言落在 SQL 指纹上**(用户视角),metrics/日志只做中间态
+定位。统一 `require.Eventually` 轮询断言。
 
 ## 3. 场景矩阵
 
-统一节奏：`require.Eventually` 轮询断言,超时按事件类型给预算（见每行）。
-
-### P0 —— 核心链路与故障（首批实现）
+### P0 —— 核心链路与故障
 
 | # | 场景 | 步骤 | 断言 | 时限预算 |
 |---|---|---|---|---|
-| S1 | 基础链路 | compose up 全套 → 连 sidecar | SQL 指纹集合 = {tidb-0, tidb-1}；hub `backends=2`，`subscribers≥1` | 启动后 60s |
-| S2 | TiDB 扩容 | `docker compose up tidb-2` | 指纹集合出现 tidb-2（sidecar 不重启） | 30s（推送秒级 + 健康检查 3s + 路由收敛） |
-| S3 | TiDB 优雅缩容 | `docker stop tidb-2`（SIGTERM，TiDB 主动清 etcd key） | 指纹集合移除 tidb-2；期间 SQL 零错误（存量连接由既有迁移逻辑处理，e2e 只断言新连接） | 30s |
-| S4 | TiDB 硬杀 | `docker kill tidb-1` | 指纹先靠 sidecar 本地健康检查摘除（秒级，新连接不再去 tidb-1）；hub 侧 `backends` 在 lease TTL（~45s）后降为 1 | 健康摘除 15s；拓扑收敛 90s |
-| S5 | Hub 故障切换 | 找出 sidecar 当前连的 hub（两台 hub 的 `subscribers` 指标），`docker kill` 它 → 再扩容一台 TiDB | sidecar 日志出现 reconnecting；新 TiDB 仍进入指纹集合（经另一台 hub） | 60s |
-| S6 | 全 hub 宕机降级 | kill 两台 hub | 存量拓扑 SQL 持续可用；**缓存内后端**宕机被健康检查围栏、重启后恢复可路由（resurrection，实测确认的正确行为）；**真正新增**（缓存从未见过）的 TiDB 不可见；hub 恢复后可见 | 降级验证 15s；恢复收敛 120s |
+| S1 | 基础链路 | compose up 全套 → 连 sidecar | 指纹集合 = {tidb-0, tidb-1};hub `backends=2` | 启动后 60s |
+| S2 | TiDB 扩容 | `up tidb-2` | 指纹出现 tidb-2(sidecar 不重启) | 30s(hub watch + 轮询 3s + 健康检查 3s) |
+| S3 | TiDB 优雅缩容 | `stop tidb-2`(SIGTERM,TiDB 主动清 etcd key) | 指纹移除 tidb-2;期间新连接零错误 | 30s |
+| S4 | TiDB 硬杀 | `kill tidb-1` | 新连接先靠 sidecar 本地健康检查摘除(秒级);hub `backends` 在 lease TTL(~45s)后降为 1 | 健康摘除 15s;拓扑收敛 90s |
+| S5 | Hub 故障切换 | client 粘住地址表首位(hub-0),`kill hub-0` → 再扩容一台 TiDB | sidecar 日志出现 `rotating to the next hub`;新 TiDB 经 hub-1 进入指纹 | 60s |
+| S6 | 全 hub 宕机降级 | kill 两台 hub | 存量拓扑 SQL 持续可用;**缓存内后端**宕机被健康检查围栏、重启后恢复可路由(resurrection);**缓存从未见过**的新 TiDB 不可见;hub 恢复后可见 | 降级验证 15s;恢复收敛 120s |
 
 ### P1 —— 生命周期与灰度
 
 | # | 场景 | 步骤 | 断言 | 时限 |
 |---|---|---|---|---|
-| S7 | Hub 重启 full 重推 | hub 宕机期间缩容 tidb-2（制造 sidecar 缓存 stale）→ 重启 hub | 缓存驱逐的观测 = 该 stale 后端健康检查 tick（debug 日志 `unhealthy backend is not in router`）的**停止**；宕机期间 tick 持续增长为正向对照。⚠️ 两个不可用的观测：per-backend metrics 序列（2h retention GC 才清）、router 的 list-removal 日志（只对 router 仍持有的后端触发，被围栏且无连接的早已不在 router） | 120s |
-| S8 | 灰度热切换 | sidecar-pd（pd 模式）经 `PUT /api/admin/config/` 切 hub 模式 → 再切回 | 切换前持有的连接跨两次切换零错误；hub `subscribers` 总数 ±1 证实真切换；指纹集合不变。⚠️ 配置接口是 **merge 语义**（TOML 数组缺席=保留旧值），回切必须显式给 pd-source 的 backend-clusters 条目 | 每次 60s |
+| S7 | Hub 重启后驱逐 stale 缓存 | hub 全宕期间缩容 tidb-2(制造 sidecar 缓存 stale)→ 重启 hub | 驱逐的观测 = 该 stale 后端健康检查 tick(debug 日志 `unhealthy backend is not in router`)**停止**;宕机期间 tick 持续增长为正向对照。⚠️ 两个不可用的观测:per-backend metrics 序列(2h retention 才 GC)、router list-removal 日志(只对 router 仍持有的后端触发) | 120s |
+| S8 | 灰度热切换 | sidecar-pd 经 `PUT /api/admin/config/` pd→hub → 再切回 | 切换前持有的连接跨两次切换零错误;每次切换 `updated backend cluster` 日志 +1 证实集群真重建;指纹集合不变。⚠️ 配置接口 **merge 语义**(TOML 数组缺席=保留旧值),回切必须显式给 pd-source 的 backend-clusters 条目 | 每次 60s |
 
-### P2 —— 规模与价值验证（后续，可选）
+### P2 —— 规模与价值验证(backlog)
 
 | # | 场景 | 说明 |
 |---|---|---|
-| S9 | 规模烟囱 | `docker compose up --scale sidecar=30`，单 hub `subscribers=30`，随机抽 sidecar 验指纹 |
-| S10 | PD 负载对比（卖点验证） | 30 sidecar 分别跑 pd 模式 / hub 模式 5 分钟，采 PD `etcd_debugging_mvcc_range_total` 或 grpc served QPS，报告对比比值（预期 ~N/K 倍差） |
+| S9 | 规模烟囱 | `--scale sidecar=30`,随机抽 sidecar 验指纹;hub `requests_total` 速率 ≈ 30/3s |
+| S10 | PD 负载对比(卖点验证) | 30 sidecar 分别跑 pd/hub 模式 5 分钟,采 PD etcd range/grpc QPS,报告比值(预期 ~N/K 倍差) |
 
-## 4. 仓库落位与运行方式
+## 4. 运行方式
 
 ```
 e2e/
   docker-compose.yaml        # pd/tikv/tidb-{0,1,2}/hub-{0,1}/sidecar/sidecar-pd
-  conf/                      # hub.toml sidecar.toml sidecar-pd.toml
-  e2e_test.go                # 场景实现,//go:build e2e
-  harness.go                 # compose 编排(docker CLI 封装)、SQL 指纹、指标读取
+  Dockerfile.pd-discovery    # alpine + 静态 pd-server,入口 services tidb-discovery
+  conf/                      # sidecar.toml sidecar-pd.toml
+  e2e_test.go harness.go     # //go:build e2e
 ```
 
-- **build tag 隔离**：`//go:build e2e`，`go test ./...` 不受影响。
-- sidecar 日志级别为 debug：S7 的缓存驱逐断言依赖 router 的 debug tick。
-- 运行：`make e2e` → 构建镜像（复用 `make docker`）→ `go test -tags e2e ./e2e/
-  -v -timeout 30m`。测试自己 `compose up/down`（`t.Cleanup` 保证残局清理）。
-- 镜像版本：`TIPROXY_IMAGE` 环境变量注入，默认 `moonsphere/tiproxy:discovery-hub`；
-  PD/TiKV/TiDB 用固定 tag（如 v8.5.x），避免 latest 漂移。
-- 场景间**不共享集群状态**：P0 一套 compose 起一次跑 S1-S6（有序，前一场景的
-  终态是后一场景的初态，节省起集群时间 ~1-2min/次）；S7/S8 各自独立 up/down。
+1. hub 镜像(在 pingkai/pd 仓库):
 
-## 5. 边界（不在本 e2e 范围）
+   ```bash
+   CGO_ENABLED=0 go build -tags without_dashboard ./cmd/pd-server
+   docker build -f <tiproxy>/e2e/Dockerfile.pd-discovery -t tidb-discovery:e2e .
+   ```
 
-- 连接迁移语义（session migration）本身 —— 上游既有能力，非 hub 引入。
-- keyspace 拓扑 —— 单测已覆盖解析,e2e 需要 keyspace 化的 TiDB 部署，重。
-- TLS 对称/非对称矩阵 —— 单测 + 排障文档覆盖；e2e 只跑明文。
-- 1000 级规模 —— S9 到 30 即可证明编排正确性,千级留给 k8s 环境专项压测。
+2. tiproxy 仓库:`make e2e` —— 构建 sidecar 镜像(复用 `make docker`)后
+   `go test -tags e2e ./e2e/ -v -timeout 30m`。测试自管 compose up/down
+   (`t.Cleanup` 清残局)。
 
-## 6. 时间预算
+- 镜像注入:`TIPROXY_IMAGE`(默认 `moonsphere/tiproxy:discovery-hub`)、
+  `TIDB_DISCOVERY_IMAGE`(默认 `tidb-discovery:e2e`);PD/TiKV/TiDB 固定 tag
+  (v8.5.x),避免 latest 漂移。
+- build tag 隔离:`go test ./...` 不受影响。
+- sidecar 日志级别 debug:S7 的驱逐断言依赖 router 的 debug tick。
+- P0 一套 compose 有序跑 S1-S6(前一场景终态 = 后一场景初态,省起集群时间);
+  S7/S8 各自独立 up/down。全套 < 10min。
+- CI 无(fork 无 pipeline),本地/手动触发。
 
-P0 全套（含起集群）目标 < 10min；P1 每场景 < 3min。CI 无（fork 无 pipeline），
-本地/手动触发 `make e2e`。
+## 5. 边界(不在本 e2e 范围)
+
+- 连接迁移(session migration)语义 —— 上游既有能力,非本功能引入。
+- keyspace 拓扑 —— 单测已盖解析;e2e 需 keyspace 化部署,重。
+- TLS 对称/非对称矩阵 —— 单测 + [ops 排障](discovery-hub-ops.md) 覆盖;e2e 走明文。
+- 千级规模 —— S9 到 30 证明编排正确性,千级留 k8s 专项。
