@@ -5,47 +5,78 @@ package backendcluster
 
 import (
 	"context"
+	"encoding/json"
+	"hash/fnv"
+	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/pkg/discovery"
 	"github.com/pingcap/tiproxy/pkg/manager/infosync"
 	"github.com/stretchr/testify/require"
 )
 
-// startTestHub runs a discovery hub against the given etcd cluster and
-// returns its HTTP address.
-func startTestHub(t *testing.T, pd *managerTestEtcdCluster) string {
-	lg := zapLoggerForTest(t)
-	hub := discovery.NewHub(lg.Named("hub"), pd.client, nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	hub.Run(ctx)
-	t.Cleanup(func() {
-		cancel()
-		require.NoError(t, hub.Close())
-	})
+// hubStub is a minimal stand-in for the PD-side tidb-discovery service with
+// the same ETag/If-None-Match semantics.
+type hubStub struct {
+	t   *testing.T
+	srv *httptest.Server
+	mu  struct {
+		sync.Mutex
+		body []byte
+		etag string
+	}
+}
 
-	gin.SetMode(gin.ReleaseMode)
-	engine := gin.New()
-	engine.Group("api").GET("/topology", hub.HandleTopology)
-	srv := httptest.NewServer(engine.Handler())
-	t.Cleanup(srv.Close)
-	return srv.Listener.Addr().String()
+func startHubStub(t *testing.T) *hubStub {
+	hs := &hubStub{t: t}
+	hs.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hs.mu.Lock()
+		body, etag := hs.mu.body, hs.mu.etag
+		hs.mu.Unlock()
+		if r.URL.Path != "/api/topology" || body == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", etag)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(hs.srv.Close)
+	return hs
+}
+
+func (hs *hubStub) set(backends ...discovery.TiDBInstance) {
+	body, err := json.Marshal(&discovery.TopologyResponse{Revision: 1, Backends: backends})
+	require.NoError(hs.t, err)
+	hash := fnv.New64a()
+	_, _ = hash.Write(body)
+	hs.mu.Lock()
+	hs.mu.body = body
+	hs.mu.etag = strconv.FormatUint(hash.Sum64(), 16)
+	hs.mu.Unlock()
+}
+
+func (hs *hubStub) addr() string {
+	return hs.srv.Listener.Addr().String()
 }
 
 func TestManagerWithHubSourcedCluster(t *testing.T) {
 	// One PD-sourced cluster and one hub-sourced cluster in the same manager.
 	pdA := newManagerTestEtcdCluster(t)
-	pdB := newManagerTestEtcdCluster(t)
 	t.Cleanup(func() { pdA.close(t) })
-	t.Cleanup(func() { pdB.close(t) })
 	pdA.putTopology(t, "10.0.0.1:4000", &infosync.TiDBTopologyInfo{IP: "10.0.0.1", StatusPort: 10080})
-	pdB.putTopology(t, "10.0.0.2:4000", &infosync.TiDBTopologyInfo{IP: "10.0.0.2", StatusPort: 10080})
 
-	hubAddr := startTestHub(t, pdB)
+	hub := startHubStub(t)
+	hub.set(discovery.TiDBInstance{Addr: "10.0.0.2:4000", IP: "10.0.0.2", StatusPort: 10080})
+	hubAddr := hub.addr()
 
 	cfg := newManagerTestConfig()
 	cfg.Proxy.BackendClusters = []config.BackendCluster{
@@ -80,8 +111,11 @@ func TestManagerWithHubSourcedCluster(t *testing.T) {
 			topology[backendID("cluster-b", "10.0.0.2:4000")].ClusterName == "cluster-b"
 	}, 5*time.Second, 100*time.Millisecond)
 
-	// The hub-sourced cluster sees topology changes pushed by the hub.
-	pdB.putTopology(t, "10.0.0.3:4000", &infosync.TiDBTopologyInfo{IP: "10.0.0.3", StatusPort: 10080})
+	// The hub-sourced cluster sees topology changes served by the hub.
+	hub.set(
+		discovery.TiDBInstance{Addr: "10.0.0.2:4000", IP: "10.0.0.2", StatusPort: 10080},
+		discovery.TiDBInstance{Addr: "10.0.0.3:4000", IP: "10.0.0.3", StatusPort: 10080},
+	)
 	require.Eventually(t, func() bool {
 		topology, err := mgr.GetTiDBTopology(context.Background())
 		return err == nil && len(topology) == 3 && topology[backendID("cluster-b", "10.0.0.3:4000")] != nil

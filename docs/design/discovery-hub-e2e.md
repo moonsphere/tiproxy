@@ -40,8 +40,8 @@ TiDB×2**（两台 TiDB 才能断言路由分布与摘除）。
   Go test harness（host，docker CLI + mysql driver + HTTP）  │
 ```
 
-- hub-0/hub-1、sidecar 都用 `moonsphere/tiproxy:discovery-hub` 镜像，仅 command
-  与挂载的 toml 不同。
+- hub-0/hub-1 用 PD 侧组件镜像(`TIDB_DISCOVERY_IMAGE`,由 pingkai/pd 静态编译
+  构建,见 e2e/Dockerfile.pd-discovery);sidecar 用 `TIPROXY_IMAGE`。
 - sidecar 配置：`discovery-source = "hub"`、`hub-addrs = "hub-0:3080,hub-1:3080"`、
   **无 pd-addrs**（顺带持续验证零 PD 路径）。
 - 对照组（场景 S8 用）：`sidecar-pd`，`pd-addrs = "pd:2379"` 传统模式。
@@ -51,7 +51,7 @@ TiDB×2**（两台 TiDB 才能断言路由分布与摘除）。
 | 手段 | 用途 |
 |---|---|
 | **SQL 指纹**：host 用 go-sql-driver 连 sidecar:6000，`SELECT @@port`（tidb-0=4000 映射区分）循环 N 次收集集合 | 路由真相 —— 后端可达性/分布/摘除的最终裁决 |
-| **hub /metrics**：`tiproxy_discovery_{backends,subscribers,revision,rebootstrap_total}` | hub 侧状态 |
+| **hub /metrics**：`tidb_discovery_{backends,revision,rebootstrap_total}` | hub 侧状态 |
 | **sidecar 日志 grep**：`docker logs`（reconnecting / not pushed snapshot） | 切换与降级路径确认 |
 | **PD etcd 直查**（etcdctl in pd 容器）：`/topology/tidb/` key 存在性 | 区分"TiDB 没注册"和"链路没传到" |
 
