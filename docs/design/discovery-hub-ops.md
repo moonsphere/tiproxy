@@ -29,12 +29,48 @@ pd-server services tidb-discovery \
   --listen-addr=http://0.0.0.0:3080
 ```
 
-- K≥2 副本挂在一个 k8s Service(如 `tidb-discovery.<ns>.svc:3080`)后面,部署在
-  **TiDB 集群侧**(与 PD 同网络/安全域,etcd 访问面不出集群边界)。
+- K≥2 副本,部署在 **TiDB 集群侧**(与 PD 同网络/安全域,etcd 访问面不出集群
+  边界);k8s 下挂一个 Service(如 `tidb-discovery.<ns>.svc:3080`),tiup 下用
+  静态地址列表(见下节)。
 - readiness 探针:`GET /api/topology`(首次 bootstrap 前 503)或 `GET /status`。
 - TLS: `--cacert/--cert/--key`(集群证书),与 PD 组件一致。
 - 服务同时注册进 PD service registry(pd-ctl 可观测);**sidecar 的 hub 地址仍由
   Service DNS/静态配置下发,不依赖 registry**。
+
+### 用 tiup 部署 Hub
+
+pingkai/tiup(分支 `feat/tidb-discovery-mcs`)已支持 `tidb-discovery` 组件,
+与 tso/scheduling 同款的 PD 微服务管理方式,**复用 `pd` 安装包**(无独立
+tarball,tiup 下载 pd 包后以 `bin/pd-server services tidb-discovery` 启动):
+
+```yaml
+# topology.yaml
+pd_servers:
+  - host: 10.0.1.1
+  - host: 10.0.1.2
+tidb_discovery_servers:          # K≥2
+  - host: 10.0.1.11              # port 默认 3479,可按实例覆盖
+  - host: 10.0.1.12
+    # port: 3479
+    # config: {}                 # 实例级配置,写入 conf/tidb-discovery.toml
+
+# server_configs:
+#   tidb_discovery: {}           # 全局配置,与实例 config 合并
+# component_versions:
+#   tidb_discovery: v8.5.x       # 缺省随集群版本(取 pd 包版本)
+```
+
+- `--backend-endpoints` 由 tiup 从拓扑里的 `pd_servers` 自动生成
+  (advertise client URL 列表),**无需手填**;`--listen-addr` /
+  `--advertise-listen-addr` / `--config` / 日志路径同样由 run script 渲染。
+- `tiup cluster display` 健康判定 = `GET /status`;组件无 primary,display
+  没有 `|P` 标记,restart / scale-in 无顺序要求。
+- Prometheus 自动加 `tidb_discovery` scrape job,§6 的指标开箱可见。
+- 日常运维即标准动作:`tiup cluster scale-out / scale-in / restart -R tidb-discovery`。
+- sidecar 的 `hub-addrs` 填各实例 `host:port` 静态列表
+  (如 `10.0.1.11:3479,10.0.1.12:3479`)。
+- `tiup playground` 亦有对应 wiring(`tidb_discovery` 配置项),本地起套件验证用。
+- 注意:该组件仅存在于 pingkai fork(tiup + pd),上游 tiup/pd 均无。
 
 ### Sidecar（`tiproxy` 代理模式）
 
