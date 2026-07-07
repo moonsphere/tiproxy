@@ -79,21 +79,23 @@ services:
     depends_on:
       - tikv
 
+  # The hubs are the PD-side tidb-discovery service (pd-server services
+  # tidb-discovery), built from pingkai/pd. See Dockerfile.pd-discovery.
   hub-0:
-    image: ${TIPROXY_IMAGE:-moonsphere/tiproxy:discovery-hub}
-    entrypoint: ["/bin/tiproxy", "discovery", "--config", "/etc/proxy-e2e/hub.toml"]
-    volumes:
-      - ./conf:/etc/proxy-e2e:ro
+    image: ${TIDB_DISCOVERY_IMAGE:-tidb-discovery:e2e}
+    command:
+      - --backend-endpoints=http://pd:2379
+      - --listen-addr=http://0.0.0.0:3080
     ports:
       - "43081:3080"
     depends_on:
       - pd
 
   hub-1:
-    image: ${TIPROXY_IMAGE:-moonsphere/tiproxy:discovery-hub}
-    entrypoint: ["/bin/tiproxy", "discovery", "--config", "/etc/proxy-e2e/hub.toml"]
-    volumes:
-      - ./conf:/etc/proxy-e2e:ro
+    image: ${TIDB_DISCOVERY_IMAGE:-tidb-discovery:e2e}
+    command:
+      - --backend-endpoints=http://pd:2379
+      - --listen-addr=http://0.0.0.0:3080
     ports:
       - "43082:3080"
     depends_on:
