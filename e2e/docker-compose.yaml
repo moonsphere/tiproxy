@@ -15,6 +15,9 @@ services:
       - --advertise-client-urls=http://pd:2379
       - --peer-urls=http://0.0.0.0:2380
       - --advertise-peer-urls=http://pd:2380
+    ports:
+      # The scale scenarios sample the embedded-etcd counters from the host.
+      - "42379:2379"
 
   tikv:
     image: ${TIDB_CLUSTER_IMAGE_PREFIX:-pingcap/}tikv:${TIDB_CLUSTER_VERSION:-v8.5.1}
@@ -125,3 +128,24 @@ services:
     depends_on:
       - hub-0
       - hub-1
+
+  # Scalable fleets for the P2 scale scenarios (S9/S10). No host ports: the
+  # assertions go through the hub metrics, the PD counters, and docker exec.
+  sidecar-fleet:
+    image: ${TIPROXY_IMAGE:-moonsphere/tiproxy:discovery-hub}
+    entrypoint: ["/bin/tiproxy", "--config", "/etc/proxy-e2e/sidecar.toml"]
+    profiles: ["fleet-hub"]
+    volumes:
+      - ./conf:/etc/proxy-e2e:ro
+    depends_on:
+      - hub-0
+      - hub-1
+
+  sidecar-pd-fleet:
+    image: ${TIPROXY_IMAGE:-moonsphere/tiproxy:discovery-hub}
+    entrypoint: ["/bin/tiproxy", "--config", "/etc/proxy-e2e/sidecar-pd.toml"]
+    profiles: ["fleet-pd"]
+    volumes:
+      - ./conf:/etc/proxy-e2e:ro
+    depends_on:
+      - pd

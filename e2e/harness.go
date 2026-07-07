@@ -32,6 +32,7 @@ const (
 	hub1API        = "http://127.0.0.1:43082"
 	canaryDSN      = "root@tcp(127.0.0.1:46001)/test"
 	canaryAPI      = "http://127.0.0.1:43083"
+	pdAPI          = "http://127.0.0.1:42379"
 
 	// fingerprintSamples is how many connections one fingerprint round opens.
 	// Routing is score-based, not round-robin, so use enough samples to hit
@@ -68,7 +69,9 @@ func composeUp(t *testing.T, extra ...string) {
 			return
 		}
 		// All profiles must be passed or their services survive the down.
-		compose(t, "--profile", "scale", "--profile", "canary", "down", "-v", "--remove-orphans")
+		compose(t, "--profile", "scale", "--profile", "canary",
+			"--profile", "fleet-hub", "--profile", "fleet-pd",
+			"down", "-v", "--remove-orphans")
 	})
 }
 
@@ -156,6 +159,61 @@ func assertContinuousSQL(t *testing.T, duration time.Duration) {
 		require.NoError(t, err, "SQL through the sidecar failed during the availability window")
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+// metricSum scrapes an API address and sums every sample of the metric,
+// labeled or not (e.g. all the code="..." series of a requests counter).
+// It never fails the test, so it is safe inside require.Eventually conditions.
+func metricSum(api, name string) (float64, error) {
+	resp, err := http.Get(api + "/metrics")
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+	sum, found := 0.0, false
+	for _, line := range strings.Split(string(body), "\n") {
+		if !strings.HasPrefix(line, name+" ") && !strings.HasPrefix(line, name+"{") {
+			continue
+		}
+		fields := strings.Fields(line)
+		v, err := strconv.ParseFloat(fields[len(fields)-1], 64)
+		if err != nil {
+			continue
+		}
+		sum, found = sum+v, true
+	}
+	if !found {
+		return 0, fmt.Errorf("metric %s not found on %s", name, api)
+	}
+	return sum, nil
+}
+
+// dockerExec runs a command inside a compose container without failing the
+// test, so it is safe inside require.Eventually conditions.
+func dockerExec(container string, args ...string) (string, error) {
+	out, err := exec.Command("docker", append([]string{"exec", container}, args...)...).CombinedOutput()
+	return string(out), err
+}
+
+// waitCondition waits until cond returns true.
+func waitCondition(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	require.Eventually(t, cond, timeout, time.Second, msg)
+}
+
+// runningContainers counts the running containers of one compose service.
+func runningContainers(service string) int {
+	out, err := composeOutput("ps", "-q", service)
+	if err != nil {
+		return 0
+	}
+	return len(strings.Fields(out))
 }
 
 // metricValue scrapes one plain (untyped/gauge/counter) metric from an API address.

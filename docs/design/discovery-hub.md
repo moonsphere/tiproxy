@@ -48,7 +48,9 @@ leader;egress 随 `tiproxy 数 × tidb 数` 增长。
 | **HubClient(sidecar)** | tiproxy,`pkg/discovery` | 每 3s 轮询,维护本地拓扑缓存,作为 backend cluster 的 topology source |
 
 负载收敛:PD etcd 的消费者从 N 降到 K;稳态流量 = N 次**空 304** / 3s,由 K 副
-本分摊;服务内部 1 次序列化缓存,每请求 O(1)。
+本分摊;服务内部 1 次序列化缓存,每请求 O(1)。实测(e2e S10,30 实例 fleet,
+60s 窗口):PD etcd range 请求 pd 模式 2800 vs hub 模式 160(**17.5×**,hub 模
+式的 160 全部为 PD 自身与 TiDB 的本底,fleet 贡献为零)。
 
 ## 3. 线协议
 
@@ -181,6 +183,5 @@ hub-addrs = "tidb-discovery.<ns>.svc:3080"   # 逗号列表或 Service DNS
 
 ## 9. 后续
 
-- P2 规模验证:30 sidecar 烟囱 + PD 负载 pd/hub 模式对比(见 e2e 文档 S9/S10)。
-- k8s 千级压测(kind/真集群专项)。
+- k8s 千级压测(kind/真集群专项;30 实例的编排与负载对比见 e2e S9/S10,已实测)。
 - 上游化(pingcap/tiproxy + tikv/pd)。
