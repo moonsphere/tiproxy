@@ -18,6 +18,13 @@
 >
 > E2E 环境注记：宿主机磁盘 >90% 会触发 TiKV low-space 保护导致 TiDB bootstrap
 > FATAL —— compose 已给 TiKV 声明 `--capacity=10GB` 规避。
+>
+> **宿主迁移（2026-07-07,PD-1/TP-2/TP-1)**:hub 迁入 pingkai/pd
+> (`pkg/mcs/tidbdiscovery`,`pd-server services tidb-discovery`,PR
+> pingkai/pd#407);tiproxy e2e 换 PD 镜像 8 场景验证等价后,tiproxy 侧 hub
+> server(hub.go/discovery 子命令/conf/hub.toml/hub 指标)删除。sidecar 侧
+> (client.go/types.go/配置)保留,契约由两侧 golden JSON 测试互锁。见
+> [discovery-hub-pd-external.md](discovery-hub-pd-external.md)。
 
 约定（全仓库通用）：
 - 错误处理用 `lib/util/errors`（`errors.WithStack` / `errors.Wrapf`），重试用

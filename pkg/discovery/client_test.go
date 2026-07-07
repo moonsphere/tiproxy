@@ -6,6 +6,12 @@ package discovery
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
+	"hash/fnv"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +19,73 @@ import (
 	"github.com/pingcap/tiproxy/pkg/manager/infosync"
 	"github.com/stretchr/testify/require"
 )
+
+const testTimeout = 3 * time.Second
+
+// topoStub is a minimal stand-in for the PD-side tidb-discovery service:
+// it serves a settable TopologyResponse with the same ETag/If-None-Match
+// semantics (content hash).
+type topoStub struct {
+	t   *testing.T
+	srv *httptest.Server
+	mu  struct {
+		sync.Mutex
+		body []byte
+		etag string
+	}
+}
+
+func newTopoStub(t *testing.T) *topoStub {
+	ts := &topoStub{t: t}
+	ts.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ts.mu.Lock()
+		body, etag := ts.mu.body, ts.mu.etag
+		ts.mu.Unlock()
+		if r.URL.Path != "/api/topology" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if body == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if r.Header.Get("If-None-Match") == etag {
+			w.Header().Set("ETag", etag)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(ts.srv.Close)
+	return ts
+}
+
+func (ts *topoStub) addr() string {
+	return ts.srv.Listener.Addr().String()
+}
+
+func (ts *topoStub) set(resp TopologyResponse) {
+	body, err := json.Marshal(&resp)
+	require.NoError(ts.t, err)
+	hash := fnv.New64a()
+	_, _ = hash.Write(body)
+	ts.mu.Lock()
+	ts.mu.body = body
+	ts.mu.etag = strconv.FormatUint(hash.Sum64(), 16)
+	ts.mu.Unlock()
+}
+
+func backend(addr, ip string, port uint, keyspace string) TiDBInstance {
+	return TiDBInstance{
+		Addr:       addr,
+		IP:         ip,
+		StatusPort: port,
+		Labels:     map[string]string{"zone": "z1"},
+		Keyspace:   keyspace,
+	}
+}
 
 func newTestHubClient(t *testing.T, addrs string) *HubClient {
 	lg, _ := logger.CreateLoggerForTest(t)
@@ -34,29 +107,40 @@ func waitClientTopology(t *testing.T, cli *HubClient, check func(map[string]*inf
 			return false
 		}
 		return check(topo)
-	}, testRecvTimeout, 10*time.Millisecond)
+	}, testTimeout, 10*time.Millisecond)
 }
 
 func TestHubClientPollAndApply(t *testing.T) {
-	ts := newHubTestSuite(t)
-	t.Cleanup(ts.close)
-	ts.putTiDB("1.1.1.1:4000", "", "1.1.1.1", 10080)
-
-	cli := newTestHubClient(t, ts.addr)
+	stub := newTopoStub(t)
+	stub.set(TopologyResponse{
+		Revision: 7,
+		Backends: []TiDBInstance{backend("1.1.1.1:4000", "1.1.1.1", 10080, "")},
+	})
+	cli := newTestHubClient(t, stub.addr())
 
 	// The snapshot arrives with all the fields.
 	waitClientTopology(t, cli, func(topo map[string]*infosync.TiDBTopologyInfo) bool {
 		info := topo["1.1.1.1:4000"]
-		return len(topo) == 1 && info != nil && info.IP == "1.1.1.1" && info.StatusPort == 10080 && info.Addr == "1.1.1.1:4000"
+		return len(topo) == 1 && info != nil && info.IP == "1.1.1.1" &&
+			info.StatusPort == 10080 && info.Addr == "1.1.1.1:4000"
 	})
 
 	// Changes are picked up by the next polls.
-	ts.putTiDB("2.2.2.2:4000", "ks1", "2.2.2.2", 10080)
+	stub.set(TopologyResponse{
+		Revision: 8,
+		Backends: []TiDBInstance{
+			backend("1.1.1.1:4000", "1.1.1.1", 10080, ""),
+			backend("2.2.2.2:4000", "2.2.2.2", 10080, "ks1"),
+		},
+	})
 	waitClientTopology(t, cli, func(topo map[string]*infosync.TiDBTopologyInfo) bool {
 		info := topo["2.2.2.2:4000"]
 		return len(topo) == 2 && info != nil && info.Keyspace == "ks1"
 	})
-	ts.deleteTTL("2.2.2.2:4000", "ks1")
+	stub.set(TopologyResponse{
+		Revision: 9,
+		Backends: []TiDBInstance{backend("1.1.1.1:4000", "1.1.1.1", 10080, "")},
+	})
 	waitClientTopology(t, cli, func(topo map[string]*infosync.TiDBTopologyInfo) bool {
 		return len(topo) == 1
 	})
@@ -66,7 +150,7 @@ func TestHubClientPollAndApply(t *testing.T) {
 		cli.mu.RLock()
 		defer cli.mu.RUnlock()
 		return cli.mu.etag != ""
-	}, testRecvTimeout, 10*time.Millisecond)
+	}, testTimeout, 10*time.Millisecond)
 }
 
 func TestHubClientNotReady(t *testing.T) {
@@ -79,45 +163,59 @@ func TestHubClientNotReady(t *testing.T) {
 	require.ErrorIs(t, err, infosync.ErrNoProm)
 }
 
-func TestHubClientFailover(t *testing.T) {
-	// Two hubs against the same PD: the client rotates on failure.
-	ts := newHubTestSuite(t)
-	t.Cleanup(ts.close)
-	ts.putTiDB("1.1.1.1:4000", "", "1.1.1.1", 10080)
-
-	// The second hub shares the same etcd.
-	lg, _ := logger.CreateLoggerForTest(t)
-	hub2 := NewHub(lg.Named("hub2"), ts.testCli, nil)
-	hub2.bootstrapRetryIntvl = 50 * time.Millisecond
-	hub2.promRefreshIntvl = 100 * time.Millisecond
-	ctx2, cancel2 := context.WithCancel(context.Background())
-	hub2.Run(ctx2)
-	t.Cleanup(func() {
-		cancel2()
-		require.NoError(t, hub2.Close())
+func TestHubClientPromInfo(t *testing.T) {
+	stub := newTopoStub(t)
+	stub.set(TopologyResponse{
+		Revision:   1,
+		Backends:   []TiDBInstance{backend("1.1.1.1:4000", "1.1.1.1", 10080, "")},
+		Prometheus: &PrometheusInfo{IP: "9.9.9.9", Port: 9090},
 	})
-	srv2 := startHubHTTPServer(t, hub2)
+	cli := newTestHubClient(t, stub.addr())
 
-	cli := newTestHubClient(t, ts.addr+","+srv2.Listener.Addr().String())
+	require.Eventually(t, func() bool {
+		prom, err := cli.GetPromInfo(context.Background())
+		return err == nil && prom.IP == "9.9.9.9" && prom.Port == 9090
+	}, testTimeout, 10*time.Millisecond)
+}
+
+func TestHubClientFailover(t *testing.T) {
+	// Two stubs: the client sticks to the first and rotates on failure.
+	stub1 := newTopoStub(t)
+	stub2 := newTopoStub(t)
+	topo1 := TopologyResponse{
+		Revision: 1,
+		Backends: []TiDBInstance{backend("1.1.1.1:4000", "1.1.1.1", 10080, "")},
+	}
+	stub1.set(topo1)
+	stub2.set(topo1)
+
+	cli := newTestHubClient(t, stub1.addr()+","+stub2.addr())
 	waitClientTopology(t, cli, func(topo map[string]*infosync.TiDBTopologyInfo) bool {
 		return len(topo) == 1
 	})
 
-	// Kill the first hub's endpoint: the client rotates to the second and
-	// keeps picking up updates.
-	ts.httpSrv.Close()
-	ts.putTiDB("2.2.2.2:4000", "", "2.2.2.2", 10080)
+	// Kill the first stub and change the topology on the second: the client
+	// rotates and keeps picking up updates.
+	stub1.srv.Close()
+	stub2.set(TopologyResponse{
+		Revision: 2,
+		Backends: []TiDBInstance{
+			backend("1.1.1.1:4000", "1.1.1.1", 10080, ""),
+			backend("2.2.2.2:4000", "2.2.2.2", 10080, ""),
+		},
+	})
 	waitClientTopology(t, cli, func(topo map[string]*infosync.TiDBTopologyInfo) bool {
 		return len(topo) == 2
 	})
 }
 
 func TestHubClientCopyOnWrite(t *testing.T) {
-	ts := newHubTestSuite(t)
-	t.Cleanup(ts.close)
-	ts.putTiDB("1.1.1.1:4000", "", "1.1.1.1", 10080)
-
-	cli := newTestHubClient(t, ts.addr)
+	stub := newTopoStub(t)
+	stub.set(TopologyResponse{
+		Revision: 1,
+		Backends: []TiDBInstance{backend("1.1.1.1:4000", "1.1.1.1", 10080, "")},
+	})
+	cli := newTestHubClient(t, stub.addr())
 	waitClientTopology(t, cli, func(topo map[string]*infosync.TiDBTopologyInfo) bool {
 		return len(topo) == 1
 	})
@@ -125,7 +223,13 @@ func TestHubClientCopyOnWrite(t *testing.T) {
 	require.NoError(t, err)
 
 	// A refresh after the snapshot was handed out must not mutate it.
-	ts.putTiDB("2.2.2.2:4000", "", "2.2.2.2", 10080)
+	stub.set(TopologyResponse{
+		Revision: 2,
+		Backends: []TiDBInstance{
+			backend("1.1.1.1:4000", "1.1.1.1", 10080, ""),
+			backend("2.2.2.2:4000", "2.2.2.2", 10080, ""),
+		},
+	})
 	waitClientTopology(t, cli, func(topo map[string]*infosync.TiDBTopologyInfo) bool {
 		return len(topo) == 2
 	})

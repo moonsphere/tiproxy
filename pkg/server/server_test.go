@@ -7,18 +7,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
+	"hash/fnv"
 	nethttp "net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/pingcap/tiproxy/lib/util/logger"
 	"github.com/pingcap/tiproxy/pkg/discovery"
-	"github.com/pingcap/tiproxy/pkg/manager/infosync"
 	"github.com/pingcap/tiproxy/pkg/sctx"
 	"github.com/pingcap/tiproxy/pkg/util/etcd"
 	"github.com/prometheus/client_golang/prometheus"
@@ -75,89 +74,33 @@ func resetPromRegistry() func() {
 	}
 }
 
-func TestDiscoveryServer(t *testing.T) {
-	restore := resetPromRegistry()
-	defer restore()
-
-	dir := t.TempDir()
-	lg, _ := logger.CreateLoggerForTest(t)
-	etcdServer, err := etcd.CreateEtcdServer("0.0.0.0:0", dir, lg)
-	require.NoError(t, err)
-	t.Cleanup(etcdServer.Close)
-	endpoint := etcdServer.Clients[0].Addr().String()
-
-	// Pick a free port for the API server.
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	apiAddr := lis.Addr().String()
-	require.NoError(t, lis.Close())
-
-	configFile := dir + "/config.toml"
-	configData := fmt.Sprintf("[proxy]\npd-addrs = %q\n[api]\naddr = %q\n", endpoint, apiAddr)
-	require.NoError(t, os.WriteFile(configFile, []byte(configData), 0o644))
-
-	server, err := NewDiscoveryServer(context.Background(), &sctx.Context{
-		ConfigFile: configFile,
-	})
-	require.NoError(t, err)
-
-	// The server turns ready after the first topology bootstrap, then the
-	// topology endpoint serves a (here empty) snapshot.
-	require.Eventually(t, func() bool {
-		resp, err := nethttp.Get("http://" + apiAddr + "/api/topology")
-		if err != nil {
-			return false
-		}
-		defer func() {
-			_ = resp.Body.Close()
-		}()
-		if resp.StatusCode != nethttp.StatusOK {
-			return false
-		}
-		var topo discovery.TopologyResponse
-		if err := json.NewDecoder(resp.Body).Decode(&topo); err != nil {
-			return false
-		}
-		return len(topo.Backends) == 0 && resp.Header.Get("ETag") != ""
-	}, 10*time.Second, 100*time.Millisecond)
-
-	require.NoError(t, server.Close())
-}
-
 func TestServerWithHubSourcedCluster(t *testing.T) {
 	restore := resetPromRegistry()
 	defer restore()
 
-	// The PD side: an etcd with one TiDB registered, watched by a hub.
+	// A stub of the PD-side tidb-discovery service serving one TiDB, with
+	// the same ETag semantics (content hash).
 	dir := t.TempDir()
-	lg, _ := logger.CreateLoggerForTest(t)
-	etcdServer, err := etcd.CreateEtcdServer("0.0.0.0:0", dir, lg)
-	require.NoError(t, err)
-	t.Cleanup(etcdServer.Close)
-	endpoint := etcdServer.Clients[0].Addr().String()
-	etcdCli, err := etcd.InitEtcdClientWithAddrs(lg, endpoint, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, etcdCli.Close())
+	body, err := json.Marshal(&discovery.TopologyResponse{
+		Revision: 1,
+		Backends: []discovery.TiDBInstance{{Addr: "10.0.0.1:4000", IP: "10.0.0.1", StatusPort: 10080}},
 	})
-	info, err := json.Marshal(&infosync.TiDBTopologyInfo{IP: "10.0.0.1", StatusPort: 10080})
 	require.NoError(t, err)
-	_, err = etcdCli.Put(context.Background(), infosync.TiDBTopologyPath+"10.0.0.1:4000/info", string(info))
-	require.NoError(t, err)
-	_, err = etcdCli.Put(context.Background(), infosync.TiDBTopologyPath+"10.0.0.1:4000/ttl", "1")
-	require.NoError(t, err)
-
-	hub := discovery.NewHub(lg.Named("hub"), etcdCli, nil)
-	hubCtx, hubCancel := context.WithCancel(context.Background())
-	hub.Run(hubCtx)
-	t.Cleanup(func() {
-		hubCancel()
-		require.NoError(t, hub.Close())
-	})
-	gin.SetMode(gin.ReleaseMode)
-	engine := gin.New()
-	engine.Group("api").GET("/topology", hub.HandleTopology)
-	hubSrv := httptest.NewServer(engine.Handler())
+	hash := fnv.New64a()
+	_, _ = hash.Write(body)
+	etag := strconv.FormatUint(hash.Sum64(), 16)
+	hubSrv := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		if r.URL.Path != "/api/topology" {
+			w.WriteHeader(nethttp.StatusNotFound)
+			return
+		}
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(nethttp.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", etag)
+		_, _ = w.Write(body)
+	}))
 	t.Cleanup(hubSrv.Close)
 
 	// The sidecar side: a full proxy server whose only cluster is hub-sourced,
@@ -178,7 +121,7 @@ hub-addrs = %q
 	})
 	require.NoError(t, err)
 
-	// The topology pushed by the hub reaches the cluster manager.
+	// The topology served by the hub reaches the cluster manager.
 	require.Eventually(t, func() bool {
 		topology, err := server.clusterManager.GetTiDBTopology(context.Background())
 		if err != nil || len(topology) != 1 {
@@ -191,26 +134,4 @@ hub-addrs = %q
 	}, 10*time.Second, 100*time.Millisecond)
 
 	require.NoError(t, server.Close())
-}
-
-func TestDiscoveryServerRejectsHubSource(t *testing.T) {
-	restore := resetPromRegistry()
-	defer restore()
-
-	dir := t.TempDir()
-	configFile := dir + "/config.toml"
-	configData := `
-[proxy]
-pd-addrs = ""
-[[proxy.backend-clusters]]
-name = "c1"
-discovery-source = "hub"
-hub-addrs = "127.0.0.1:3080"
-`
-	require.NoError(t, os.WriteFile(configFile, []byte(configData), 0o644))
-
-	_, err := NewDiscoveryServer(context.Background(), &sctx.Context{
-		ConfigFile: configFile,
-	})
-	require.ErrorContains(t, err, "discovery-source=hub")
 }

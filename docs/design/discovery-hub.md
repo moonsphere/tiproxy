@@ -1,5 +1,12 @@
 # TiProxy Discovery Hub 设计（sidecar mesh）
 
+> **宿主迁移（2026-07-07）**：hub 已从 tiproxy 迁入 PD 仓库,形态为
+> `pd-server services tidb-discovery`(mcs 微服务,无 primary 选举,副本对等),
+> tiproxy 侧 hub server(`tiproxy discovery` 子命令)已删除,sidecar 侧
+> (HubClient/wire 契约/配置)不变。决策与实现见
+> [discovery-hub-pd-external.md](discovery-hub-pd-external.md);本文档 §4/§5 的
+> hub 宿主描述为 tiproxy 时代的设计记录,机制(watch/ETag/短路)在 PD 侧原样保留。
+>
 > **传输层修订（2026-07-06）**：v1 传输从 gRPC 服务端流改为 **HTTP 轮询 + ETag**。
 > 动因：控制面对延迟不敏感（sidecar 侧本来就有 3s 健康检查周期），但对**可观测性
 > 极度敏感** —— HTTP 端点可以 curl 直查、零客户端依赖；且轮询消灭了推送模型的全部

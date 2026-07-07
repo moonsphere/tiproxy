@@ -10,7 +10,6 @@ import (
 
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
-	"github.com/pingcap/tiproxy/pkg/discovery"
 	"github.com/pingcap/tiproxy/pkg/manager/backendcluster"
 	"github.com/pingcap/tiproxy/pkg/manager/cert"
 	mgrcfg "github.com/pingcap/tiproxy/pkg/manager/config"
@@ -53,9 +52,6 @@ type Server struct {
 	apiServer *api.Server
 	// L7 proxy
 	proxy *proxy.SQLServer
-	// discovery hub mode only
-	hub        *discovery.Hub
-	hubEtcdCli *clientv3.Client
 }
 
 // initBase initializes the components shared by the proxy server and the
@@ -291,12 +287,6 @@ func (s *Server) Close() error {
 	}
 	if s.clusterManager != nil {
 		errs = append(errs, s.clusterManager.Close())
-	}
-	if s.hub != nil {
-		errs = append(errs, s.hub.Close())
-	}
-	if s.hubEtcdCli != nil {
-		errs = append(errs, s.hubEtcdCli.Close())
 	}
 	s.wg.Wait()
 	return errors.Collect(ErrCloseServer, errs...)

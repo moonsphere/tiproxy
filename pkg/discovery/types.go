@@ -9,11 +9,11 @@ import (
 	"github.com/pingcap/tiproxy/pkg/manager/infosync"
 )
 
-// The wire types of the topology endpoint (GET /api/topology). The JSON field
-// names are the protocol contract and MUST stay stable: the transport is
-// deliberately plain HTTP + JSON so that the topology can be inspected with
-// curl and the endpoint can later move into another host (e.g. PD) without
-// changing the clients.
+// The wire types of the topology endpoint (GET /api/topology), served by the
+// PD-side tidb-discovery service (pingkai/pd, pd-server services
+// tidb-discovery). The JSON field names are the protocol contract between the
+// two repositories and MUST stay stable; both sides pin them with golden
+// tests.
 //
 // Versioning is carried by the ETag/If-None-Match headers: the server bumps
 // an opaque version on every content change and answers 304 Not Modified to
@@ -51,21 +51,6 @@ type PrometheusInfo struct {
 	BinaryPath string `json:"binary_path,omitempty"`
 }
 
-// ToTiDBInstance converts the topology info to the wire representation.
-// GitHash, DeployPath and StartTimestamp are not consumed by any client and
-// are intentionally dropped. ClusterName is a local configuration concept
-// assigned by the backend cluster manager, so it never goes on the wire.
-func ToTiDBInstance(info *infosync.TiDBTopologyInfo) TiDBInstance {
-	return TiDBInstance{
-		Addr:       info.Addr,
-		IP:         info.IP,
-		StatusPort: info.StatusPort,
-		Labels:     maps.Clone(info.Labels),
-		Keyspace:   info.Keyspace,
-		Version:    info.Version,
-	}
-}
-
 // ToTopologyInfo converts the wire representation back to the topology info.
 func ToTopologyInfo(inst TiDBInstance) *infosync.TiDBTopologyInfo {
 	return &infosync.TiDBTopologyInfo{
@@ -84,18 +69,6 @@ func ToPromInfo(prom *PrometheusInfo) *infosync.PrometheusInfo {
 		return nil
 	}
 	return &infosync.PrometheusInfo{
-		IP:         prom.IP,
-		Port:       prom.Port,
-		BinaryPath: prom.BinaryPath,
-	}
-}
-
-// ToWirePromInfo converts the Prometheus info to the wire representation.
-func ToWirePromInfo(prom *infosync.PrometheusInfo) *PrometheusInfo {
-	if prom == nil {
-		return nil
-	}
-	return &PrometheusInfo{
 		IP:         prom.IP,
 		Port:       prom.Port,
 		BinaryPath: prom.BinaryPath,

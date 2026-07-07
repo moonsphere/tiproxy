@@ -14,44 +14,27 @@ watch 消费者从 N 收敛到 K（hub 副本数，≈3）。
 ## 2. 部署拓扑
 
 ```
-PD etcd ── watch(K 条) ── tiproxy discovery ×K ── gRPC push ── sidecar tiproxy ×N
+PD etcd ── watch(K 条) ── pd-server services tidb-discovery ×K ── HTTP 轮询+304 ── sidecar tiproxy ×N
 ```
 
-### Hub（`tiproxy discovery`）
+### Hub（`pd-server services tidb-discovery`,来自 pingkai/pd）
 
-同一个 tiproxy 二进制，`discovery` 子命令。每副本独立 watch PD，副本间无协调，
-无状态（重启后重新 bootstrap）。
-
-```toml
-# hub.toml —— hub 连 PD，在 api.addr 上服务
-[proxy]
-pd-addrs = "pd-0:2379,pd-1:2379,pd-2:2379"
-[api]
-addr = "0.0.0.0:3080"
-```
+hub 是 **PD 仓库提供的集群侧组件**(mcs 微服务),与 PD/TiDB 集群伴生部署,随
+集群发布。每副本独立 watch PD,副本对等(无 primary 选举)、无状态(重启后重新
+bootstrap)。
 
 ```
-tiproxy discovery --config hub.toml
+pd-server services tidb-discovery \
+  --backend-endpoints=http://pd-0:2379,http://pd-1:2379 \
+  --listen-addr=http://0.0.0.0:3080
 ```
 
-Docker 镜像内置模板 `/etc/proxy/hub.toml`（源码 `conf/hub.toml`），k8s 里同一镜像
-换 args 即可：
-
-```yaml
-# hub Deployment（与 sidecar 同一镜像）
-command: ["/bin/tiproxy", "discovery", "--config", "/etc/proxy/hub.toml"]
-# 用 ConfigMap 挂载覆盖 /etc/proxy/hub.toml，至少要设 pd-addrs
-```
-
-构建镜像：`make docker DOCKERPREFIX=<repo>/ IMAGE_TAG=<tag>`（多平台发布用
-`make docker-release`）。
-
-- K≥2 副本挂在一个 k8s Service（如 `tidb-discovery.<ns>.svc:3080`）后面。
-- readiness 探针：gRPC health（首次拓扑 bootstrap 成功后才 SERVING），或 HTTP
-  `GET /debug/health`。PD 不可达时 hub 永不 ready，k8s 自动把 sidecar 挡在空 hub
-  外面。
-- hub **要求恰好一个 PD 集群**配置（`pd-addrs` 或单个 `backend-clusters` 条目）。
-  多 TiDB 集群 = 每集群一组 hub。
+- K≥2 副本挂在一个 k8s Service(如 `tidb-discovery.<ns>.svc:3080`)后面,部署在
+  **TiDB 集群侧**(与 PD 同网络/安全域,etcd 访问面不出集群边界)。
+- readiness 探针:`GET /api/topology`(首次 bootstrap 前 503)或 `GET /status`。
+- TLS: `--cacert/--cert/--key`(集群证书),与 PD 组件一致。
+- 服务同时注册进 PD service registry(pd-ctl 可观测);**sidecar 的 hub 地址仍由
+  Service DNS/静态配置下发,不依赖 registry**。
 
 ### Sidecar（`tiproxy` 代理模式）
 
@@ -87,11 +70,11 @@ hub-addrs = "tidb-discovery.default.svc:3080"
 按集群条目逐步切换，`discovery-source`/`hub-addrs` 可热改（配置 reload 时该集群
 会重建）：
 
-1. 部署 K 个 hub 副本，确认全部 ready（health SERVING，`tiproxy_discovery_backends`
+1. 部署 K 个 hub 副本，确认全部 ready（health SERVING，`tidb_discovery_backends`
    与实际 TiDB 数一致）。
 2. 选 1 台 sidecar，把目标集群条目改为 `discovery-source = "hub"`，reload。
 3. 对比该实例与 pd 模式实例的后端列表（`/api/backend` 或日志），观察
-   `tiproxy_discovery_subscribers` +1。
+   `tidb_discovery_subscribers` +1。
 4. kill 一个 TiDB（或缩容），确认 canary 实例在 lease TTL（45s）+ 推送延迟内摘除
    该后端。
 5. 分批扩大；每批观察 hub 侧指标（见 §6）。
@@ -107,7 +90,7 @@ hub-addrs = "tidb-discovery.default.svc:3080"
 
 ## 6. 监控
 
-Hub 侧指标（`/metrics`，前缀 `tiproxy_discovery_`）：
+Hub 侧指标（hub 的 `/metrics`,前缀 `tidb_discovery_`）:
 
 | 指标 | 含义 | 告警建议 |
 |---|---|---|
@@ -120,11 +103,11 @@ PromQL 示例：
 
 ```promql
 # 各 hub 副本 revision 偏差
-max(tiproxy_discovery_revision) - min(tiproxy_discovery_revision)
+max(tidb_discovery_revision) - min(tidb_discovery_revision)
 # 轮询健康度: 304 占比应接近 1
-rate(tiproxy_discovery_requests_total{code="304"}[5m])
+rate(tidb_discovery_requests_total{code="304"}[5m])
 # watch 重建频率
-rate(tiproxy_discovery_rebootstrap_total[15m])
+rate(tidb_discovery_rebootstrap_total[15m])
 ```
 
 随手查拓扑（可观测性是这个传输选型的核心动因）:
@@ -146,18 +129,18 @@ Sidecar 侧无新指标；hub 断连体现在日志
 
 按序排查：
 
-1. hub 是否 ready：`grpc_health_v1` SERVING / `tiproxy_discovery_backends` 正常。
-   hub 连不上 PD 时永不 ready，所有订阅被 readiness 拒绝。
+1. hub 是否 ready:`GET /api/topology` 非 503 / `tidb_discovery_backends` 正常。
+   hub 连不上 PD 时永不 ready(持续 503)。
 2. 网络可达：sidecar 能否连通 `hub-addrs`。
-3. **TLS 配置是否对称**：hub 侧 api TLS 用 `[security.server-http-tls]`，sidecar
-   侧 HubClient 用 `[security.cluster-tls]`（与集群内组件互访 api 的既有配对一致）。
+3. **TLS 配置是否对称**:hub 侧用 PD 组件证书(`--cacert/--cert/--key`),sidecar
+   侧 HubClient 用 `[security.cluster-tls]`(集群证书体系,两侧同 CA)。
    任一侧单边开 TLS，连接会被立刻重置（TLS 握手/明文错配直接连接失败），
    表现就是这个快速轮换循环 —— 有意的 fail-fast。
 
 **症状：sidecar 后端列表长期为空，日志有 `the discovery hub has not served a topology snapshot yet`。**
 
 轮询从未成功（见上），或 hub 侧拓扑本身为空
-（`tiproxy_discovery_backends == 0`，检查 PD 里 `/topology/tidb/` 是否有存活
+（`tidb_discovery_backends == 0`，检查 PD 里 `/topology/tidb/` 是否有存活
 TiDB）。
 
 ## 8. 容量参考
