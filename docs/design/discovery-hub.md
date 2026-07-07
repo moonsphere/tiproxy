@@ -444,7 +444,8 @@ resource 策略靠 CPU/内存等 metrics 因子选后端 —— hub 模式动的
 - 健康检查仍留在 sidecar 本地（打 tidb status port，不是 PD 负载）。
 - `vip` manager 也用 per-instance etcd 选举 —— 对 sidecar 无关（mesh 无 VIP）；hub
   模式下让它保持关闭。
-- Server 可迁移成 PD 微服务（方案 B）：届时把 `.proto` 原样上移 kvproto（proto
-  package 名不变 → 线协议不变），PD/tiproxy 各自重新生成。sidecar 二进制不用动，
-  只把 `hub-addrs` 重新指向。
+- ~~Server 迁移进 PD（方案 B / B-lite）~~：HTTP 化后曾评审"把拓扑端点直接做进
+  PD API"（B-lite，见 [discovery-hub-pd-blite.md](discovery-hub-pd-blite.md)），
+  **决策暂缓** —— PD 故障域隔离、运维弹性、PD 分支维护成本三个理由，保持外置
+  hub 为长期形态。线协议是 HTTP+JSON，未来若重启该方向 sidecar 侧零改动。
 ```
