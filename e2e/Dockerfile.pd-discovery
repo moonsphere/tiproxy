@@ -1,0 +1,8 @@
+# The tidb-discovery hub built from pingkai/pd (pd-server services
+# tidb-discovery). The static pd-server binary is built outside:
+#   cd <pingkai/pd> && CGO_ENABLED=0 go build -tags without_dashboard -o pd-server ./cmd/pd-server
+# and placed next to this Dockerfile before building.
+FROM alpine:latest
+COPY pd-server /bin/pd-server
+EXPOSE 3080
+ENTRYPOINT ["/bin/pd-server", "services", "tidb-discovery"]

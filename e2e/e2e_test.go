@@ -26,8 +26,8 @@ func TestDiscoveryHub(t *testing.T) {
 	// without any PD access. The generous timeout covers the TiKV/TiDB
 	// bootstrap on a cold start.
 	t.Log("S1: basic path")
-	waitMetric(t, hub0API, "tiproxy_discovery_backends", 2, 300*time.Second)
-	waitMetric(t, hub1API, "tiproxy_discovery_backends", 2, 60*time.Second)
+	waitMetric(t, hub0API, "tidb_discovery_backends", 2, 300*time.Second)
+	waitMetric(t, hub1API, "tidb_discovery_backends", 2, 60*time.Second)
 	waitFingerprint(t, 120*time.Second, "tidb-0", "tidb-1")
 
 	// S2: a new TiDB joins; the sidecar picks it up without a restart.
@@ -92,7 +92,7 @@ func TestDiscoveryHub(t *testing.T) {
 	t.Log("S4: hard kill")
 	compose(t, "kill", "tidb-1")
 	waitFingerprint(t, 30*time.Second, "tidb-0", "tidb-2", "tidb-3")
-	waitMetric(t, hub0API, "tiproxy_discovery_backends", 3, 120*time.Second)
+	waitMetric(t, hub0API, "tidb_discovery_backends", 3, 120*time.Second)
 }
 
 // waitTiDBReady waits until a TiDB container reports it is serving. The
@@ -117,7 +117,7 @@ func waitTiDBReady(t *testing.T, service string, timeout time.Duration) {
 // them).
 func TestHubRestartFullPush(t *testing.T) {
 	composeUp(t)
-	waitMetric(t, hub0API, "tiproxy_discovery_backends", 2, 300*time.Second)
+	waitMetric(t, hub0API, "tidb_discovery_backends", 2, 300*time.Second)
 	waitFingerprint(t, 120*time.Second, "tidb-0", "tidb-1")
 
 	compose(t, "--profile", "scale", "up", "-d", "tidb-2")
@@ -145,7 +145,7 @@ func TestHubRestartFullPush(t *testing.T) {
 	// Hubs return and bootstrap from PD, which no longer has tidb-2: the
 	// full snapshot replaces the cache and the ticks stop.
 	compose(t, "start", "hub-0", "hub-1")
-	waitMetric(t, hub0API, "tiproxy_discovery_backends", 2, 120*time.Second)
+	waitMetric(t, hub0API, "tidb_discovery_backends", 2, 120*time.Second)
 
 	converged := false
 	deadline := time.Now().Add(120 * time.Second)
@@ -180,7 +180,7 @@ func staleTickCount() int {
 // switches, and the routing result must stay the same.
 func TestPdHubMigration(t *testing.T) {
 	composeUp(t, "--profile", "canary")
-	waitMetric(t, hub0API, "tiproxy_discovery_backends", 2, 300*time.Second)
+	waitMetric(t, hub0API, "tidb_discovery_backends", 2, 300*time.Second)
 
 	// The canary starts in the pd mode and routes to both backends.
 	waitCanaryFingerprint(t, 120*time.Second, "tidb-0", "tidb-1")
